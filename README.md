@@ -4,7 +4,7 @@ This repository contains a deep learning-based robot motion planning system that
 
 ## Overview
 
-The system uses a neural network to predict 4 robot arm endpoints (L1, L2, R1, R2) from 9 upper body joint positions captured via motion capture. It supports both offline training and real-time ROS2-based inference.
+The system uses a neural network to predict 2 robot end-effector trajectories (4 endpoints total) from 9 upper body joint positions captured via motion capture. It supports both offline training and real-time ROS2-based inference.
 
 ## Core Components
 
@@ -102,7 +102,7 @@ Training and inference parameters are configured via JSON files in the `configs/
 - **Trajectory Format**: CSV files with `traj_id`, joint positions, and timestamps
 
 ### Output Data
-- **Robot Endpoints**: 4 arm endpoints × 3 coordinates = 12 dimensions
+- **Robot End-effectors**: 4 endpoints (2 end-effectors × 2 points each) × 3 coordinates = 12 dimensions
 - **Trajectory Prediction**: Variable length sequences (typically 5-10 frames)
 
 ## Installation
