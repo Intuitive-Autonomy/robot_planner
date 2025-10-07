@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 # ---------- geometry ----------
 def normalize_to_torso(joints: np.ndarray, arms: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -582,7 +583,8 @@ class AugmentedDataset(Dataset):
 
         processor = AugmentedDataProcessor(os.path.dirname(os.path.dirname(file_paths[0])))
 
-        for file_path in file_paths:
+        print(f"Loading {len(file_paths)} CSV files from S3/FSx...")
+        for file_path in tqdm(file_paths, desc="Loading data", ncols=100):
             try:
                 inputs, targets = processor.load_trajectory_file(file_path)
                 self.inputs_list.append(inputs)
@@ -833,6 +835,279 @@ def create_augmented_data_loaders(data_root: str,
                              num_workers=num_workers, pin_memory=True)
 
     print(f"\nData Loaders Created:")
+    print(f"  Train: {len(train_ds)} sequences, {len(train_loader)} batches")
+    print(f"  Val:   {len(val_ds)} sequences, {len(val_loader)} batches")
+    print(f"  Test:  {len(test_ds)} sequences, {len(test_loader)} batches")
+
+    return train_loader, val_loader, test_loader
+
+
+# ========== Preprocessed NPZ Dataset (Fast Loading for AWS/S3) ==========
+
+class PreprocessedAugmentedDataset(Dataset):
+    """
+    Fast dataset that loads from preprocessed .npz file
+    Optimized for AWS S3/FSx - loads all data in one shot instead of 2000+ CSV files
+    """
+    def __init__(self,
+                 npz_path: str,
+                 file_list: List[str],
+                 data_root: str,
+                 sequence_length: int = 30,
+                 prediction_length: int = 10,
+                 augment: bool = True,
+                 rot_prob: float = 1.0,
+                 scale_prob: float = 0.5,
+                 scale_range: Tuple[float, float] = (0.9, 1.1),
+                 time_scale_prob: float = 0.4,
+                 time_scale_range: Tuple[float, float] = (0.8, 1.25),
+                 noise_std_skeleton_mm: float = 0.0,
+                 noise_std_robot_mm: float = 0.0,
+                 noise_spike_prob: float = 0.0,
+                 noise_spike_magnitude_mm: float = 200.0):
+        """
+        Args:
+            npz_path: Path to preprocessed .npz file
+            file_list: List of file paths to use from the npz (for train/val/test split)
+            data_root: Root directory (used to compute relative paths)
+            Other args: Same as AugmentedDataset
+        """
+        self.sequence_length = sequence_length
+        self.prediction_length = prediction_length
+        self.augment = augment
+        self.rot_prob = rot_prob
+        self.scale_prob = scale_prob
+        self.scale_range = scale_range
+        self.time_scale_prob = time_scale_prob
+        self.time_scale_range = time_scale_range
+        self.noise_std_skeleton_mm = noise_std_skeleton_mm
+        self.noise_std_robot_mm = noise_std_robot_mm
+        self.noise_spike_prob = noise_spike_prob
+        self.noise_spike_magnitude_mm = noise_spike_magnitude_mm
+
+        # Load preprocessed data
+        print(f"Loading preprocessed data from {npz_path}...")
+        self.data = np.load(npz_path)
+        print(f"Loaded {len(self.data.files)//2} trajectories from NPZ")
+
+        # Build mapping from file paths to data keys
+        self.inputs_list = []
+        self.targets_list = []
+
+        for file_path in file_list:
+            rel_path = os.path.relpath(file_path, data_root)
+            input_key = f"{rel_path}_inputs"
+            target_key = f"{rel_path}_targets"
+
+            if input_key in self.data and target_key in self.data:
+                self.inputs_list.append(self.data[input_key])
+                self.targets_list.append(self.data[target_key])
+            else:
+                print(f"Warning: {rel_path} not found in preprocessed data")
+
+        # Create sliding windows
+        self.sequences = []
+        min_length = sequence_length + prediction_length
+
+        for traj_idx, inputs in enumerate(self.inputs_list):
+            traj_length = inputs.shape[0]
+            if traj_length >= min_length:
+                for start_idx in range(0, traj_length - min_length + 1):
+                    self.sequences.append((traj_idx, start_idx))
+
+        print(f"Preprocessed Dataset: files={len(file_list)}, loaded={len(self.inputs_list)}, "
+              f"sequences={len(self.sequences)}, seq_len={sequence_length}, "
+              f"pred_len={prediction_length}, aug={'ON' if augment else 'OFF'}")
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def _apply_random_rotation(self, inputs_seq, targets_seq):
+        """Apply random 3D rotation to both inputs and targets"""
+        rq = random_rotation_quat()
+        R = quat_to_rotmat(rq)
+
+        inputs_3d = inputs_seq.reshape(-1, 13, 3)
+        inputs_rot = (inputs_3d @ R.T).reshape(-1, 39)
+
+        targets_3d = targets_seq.reshape(-1, 4, 3)
+        targets_rot = (targets_3d @ R.T).reshape(-1, 12)
+
+        return inputs_rot, targets_rot
+
+    def _apply_scale(self, inputs_seq, targets_seq, scale_range):
+        """Apply random uniform scaling"""
+        scale = np.random.uniform(scale_range[0], scale_range[1])
+        return inputs_seq * scale, targets_seq * scale
+
+    def _apply_time_scale(self, inputs_full, targets_full, seq_len, pred_len, scale_range):
+        """Apply random time scaling (speed up/slow down)"""
+        total_len = seq_len + pred_len
+        scale = np.random.uniform(scale_range[0], scale_range[1])
+        new_len = max(2, int(round(total_len * scale)))
+
+        inputs_resampled = resample_time(inputs_full, new_len)
+        targets_resampled = resample_time(targets_full, new_len)
+
+        start = np.random.randint(0, max(1, new_len - total_len + 1))
+        inputs_seq = inputs_resampled[start:start+seq_len]
+        targets_seq = targets_resampled[start+seq_len:start+total_len]
+
+        if inputs_seq.shape[0] < seq_len:
+            pad = np.repeat(inputs_seq[-1:, :], seq_len - inputs_seq.shape[0], axis=0)
+            inputs_seq = np.concatenate([inputs_seq, pad], axis=0)
+        inputs_seq = inputs_seq[:seq_len]
+
+        if targets_seq.shape[0] < pred_len:
+            pad = np.repeat(targets_seq[-1:, :], pred_len - targets_seq.shape[0], axis=0)
+            targets_seq = np.concatenate([targets_seq, pad], axis=0)
+        targets_seq = targets_seq[:pred_len]
+
+        return inputs_seq, targets_seq
+
+    def _apply_progressive_noise(self, inputs_seq):
+        """Apply progressive noise separately to skeleton and robot"""
+        T, D = inputs_seq.shape
+        noisy_inputs = inputs_seq.copy()
+
+        skeleton = noisy_inputs[:, :27]
+        robot = noisy_inputs[:, 27:]
+
+        if self.noise_std_skeleton_mm > 0:
+            skeleton_noise = np.random.normal(0.0, self.noise_std_skeleton_mm, size=skeleton.shape).astype(np.float32)
+            skeleton = skeleton + skeleton_noise
+
+        if self.noise_std_robot_mm > 0:
+            robot_noise = np.random.normal(0.0, self.noise_std_robot_mm, size=robot.shape).astype(np.float32)
+            robot = robot + robot_noise
+
+        noisy_inputs = np.concatenate([skeleton, robot], axis=1)
+
+        if self.noise_spike_prob > 0 and np.random.rand() < self.noise_spike_prob:
+            num_spike_frames = np.random.randint(1, 4)
+            spike_frame_indices = np.random.choice(T, size=num_spike_frames, replace=False)
+
+            for frame_idx in spike_frame_indices:
+                spike_noise = np.random.normal(0.0, self.noise_spike_magnitude_mm, size=(39,)).astype(np.float32)
+                noisy_inputs[frame_idx] += spike_noise
+
+        return noisy_inputs
+
+    def __getitem__(self, idx: int):
+        traj_idx, start_idx = self.sequences[idx]
+        inputs_full = self.inputs_list[traj_idx]
+        targets_full = self.targets_list[traj_idx]
+
+        end_input = start_idx + self.sequence_length
+        end_all = end_input + self.prediction_length
+
+        inputs_seq = inputs_full[start_idx:end_input].copy()
+        targets_seq = targets_full[end_input:end_all].copy()
+
+        if self.augment:
+            if np.random.rand() < self.time_scale_prob:
+                window_inputs = inputs_full[start_idx:end_all].copy()
+                window_targets = targets_full[start_idx:end_all].copy()
+                inputs_seq, targets_seq = self._apply_time_scale(
+                    window_inputs, window_targets,
+                    self.sequence_length, self.prediction_length,
+                    self.time_scale_range
+                )
+
+            if np.random.rand() < self.rot_prob:
+                inputs_seq, targets_seq = self._apply_random_rotation(inputs_seq, targets_seq)
+
+            if np.random.rand() < self.scale_prob:
+                inputs_seq, targets_seq = self._apply_scale(inputs_seq, targets_seq, self.scale_range)
+
+            inputs_seq = self._apply_progressive_noise(inputs_seq)
+
+        return torch.from_numpy(inputs_seq).float(), torch.from_numpy(targets_seq).float()
+
+
+def create_preprocessed_data_loaders(npz_path: str,
+                                      data_root: str,
+                                      batch_size: int = 32,
+                                      sequence_length: int = 30,
+                                      prediction_length: int = 10,
+                                      train_ratio: float = 0.8,
+                                      val_ratio: float = 0.1,
+                                      test_ratio: float = 0.1,
+                                      num_workers: int = 4,
+                                      random_seed: int = 42,
+                                      noise_std_skeleton_mm: float = 0.0,
+                                      noise_std_robot_mm: float = 0.0,
+                                      noise_spike_prob: float = 0.0,
+                                      noise_spike_magnitude_mm: float = 200.0):
+    """
+    Create train/val/test data loaders from preprocessed .npz file
+    Much faster than loading 2000+ CSV files individually
+
+    Args: Same as create_augmented_data_loaders, plus:
+        npz_path: Path to preprocessed .npz file
+
+    Returns:
+        train_loader, val_loader, test_loader
+    """
+    processor = AugmentedDataProcessor(data_root)
+    base_names = processor.get_base_names()
+    file_groups = processor.file_groups
+
+    np.random.seed(random_seed)
+    shuffled_bases = np.random.permutation(base_names).tolist()
+
+    n_total = len(shuffled_bases)
+    n_train = int(n_total * train_ratio)
+    n_val = int(n_total * val_ratio)
+
+    train_bases = shuffled_bases[:n_train]
+    val_bases = shuffled_bases[n_train:n_train+n_val]
+    test_bases = shuffled_bases[n_train+n_val:]
+
+    train_files = [f for base in train_bases for f in file_groups[base]]
+    val_files = [f for base in val_bases for f in file_groups[base]]
+    test_files = [f for base in test_bases for f in file_groups[base]]
+
+    print(f"\nPreprocessed Data Split:")
+    print(f"  Total base recordings: {n_total}")
+    print(f"  Train: {len(train_bases)} bases ({len(train_files)} files)")
+    print(f"  Val:   {len(val_bases)} bases ({len(val_files)} files)")
+    print(f"  Test:  {len(test_bases)} bases ({len(test_files)} files)")
+
+    # Create datasets using preprocessed data
+    train_ds = PreprocessedAugmentedDataset(
+        npz_path, train_files, data_root, sequence_length, prediction_length,
+        augment=True,
+        noise_std_skeleton_mm=noise_std_skeleton_mm,
+        noise_std_robot_mm=noise_std_robot_mm,
+        noise_spike_prob=noise_spike_prob,
+        noise_spike_magnitude_mm=noise_spike_magnitude_mm
+    )
+    val_ds = PreprocessedAugmentedDataset(
+        npz_path, val_files, data_root, sequence_length, prediction_length,
+        augment=False,
+        noise_std_skeleton_mm=0.0,
+        noise_std_robot_mm=0.0,
+        noise_spike_prob=0.0,
+        noise_spike_magnitude_mm=0.0
+    )
+    test_ds = PreprocessedAugmentedDataset(
+        npz_path, test_files, data_root, sequence_length, prediction_length,
+        augment=False,
+        noise_std_skeleton_mm=0.0,
+        noise_std_robot_mm=0.0,
+        noise_spike_prob=0.0,
+        noise_spike_magnitude_mm=0.0
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=True)
+
+    print(f"\nData Loaders Created (from NPZ):")
     print(f"  Train: {len(train_ds)} sequences, {len(train_loader)} batches")
     print(f"  Val:   {len(val_ds)} sequences, {len(val_loader)} batches")
     print(f"  Test:  {len(test_ds)} sequences, {len(test_loader)} batches")

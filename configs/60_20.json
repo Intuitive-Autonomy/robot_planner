@@ -1,14 +1,14 @@
 {
-  "data_root": "/home/oliver/Documents/data/Mocap/global_csv",
-  "save_dir": "./checkpoints",
+  "data_root": "/mnt/fsx/fsx/global_csv",
+  "save_dir": "./checkpoints_60_20",
 
-  "batch_size": 128,
+  "batch_size": 512,
   "sequence_length": 60,
   "prediction_length": 20,
   "train_ratio": 0.8,
   "val_ratio": 0.1,
   "test_ratio": 0.1,
-  "num_workers": 8,
+  "num_workers": 32,
 
   "hidden_dim": 256,
   "num_layers": 4,

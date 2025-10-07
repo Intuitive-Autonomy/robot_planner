@@ -1,6 +1,6 @@
 {
-  "data_root": "/home/oliver/Documents/data/Mocap/global_csv",
-  "save_dir": "./checkpoints",
+  "data_root": "/mnt/fsx/fsx/global_csv",
+  "save_dir": "./checkpoints_30_10",
 
   "batch_size": 256,
   "sequence_length": 30,
