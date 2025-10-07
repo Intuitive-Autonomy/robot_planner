@@ -371,7 +371,7 @@ def main():
 
     crit = EndpointLoss(cfg["first_w"], cfg["smooth_vel_w"], cfg["smooth_acc_w"])
     opt = optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=1e-5)
-    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8, verbose=True)
+    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8)
 
     best = float("inf")
     best_path = os.path.join(cfg["save_dir"], "best_model.pth")

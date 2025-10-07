@@ -14,6 +14,11 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server
+import matplotlib.pyplot as plt
+import csv
+from datetime import datetime
 
 from net import get_model
 from utils import PreprocessedAugmentedDataset, AugmentedDataProcessor
@@ -38,8 +43,6 @@ def parse_args():
 
     parser.add_argument('--config', type=str, default='configs/30_10.json',
                        help='Path to configuration JSON file')
-    parser.add_argument('--npz_dir', type=str, default='/mnt/fsx/fsx/global_csv/preprocessed',
-                       help='Directory containing preprocessed NPZ files (train/val/test)')
 
     return parser.parse_args()
 
@@ -120,10 +123,20 @@ def create_loaders_from_npz(npz_dir, cfg, data_root,
 def main():
     args = parse_args()
 
+    # Load config
+    with open(args.config, 'r') as f:
+        cfg = json.load(f)
+
+    print(f"Loaded config from {args.config}")
+
+    # Get npz_dir from config
+    npz_dir = cfg.get("npz_dir", "/home/ia-dev/oliver/robot_planner/preprocessed")
+    print(f"NPZ directory: {npz_dir}")
+
     # Check if NPZ files exist
-    train_npz = os.path.join(args.npz_dir, "preprocessed_train.npz")
-    val_npz = os.path.join(args.npz_dir, "preprocessed_val.npz")
-    test_npz = os.path.join(args.npz_dir, "preprocessed_test.npz")
+    train_npz = os.path.join(npz_dir, "preprocessed_train.npz")
+    val_npz = os.path.join(npz_dir, "preprocessed_val.npz")
+    test_npz = os.path.join(npz_dir, "preprocessed_test.npz")
 
     missing_files = []
     for npz_file in [train_npz, val_npz, test_npz]:
@@ -135,14 +148,8 @@ def main():
         for f in missing_files:
             print(f"  - {f}")
         print(f"\nPlease run preprocessing first:")
-        print(f"  python preprocess_data.py --data_root /mnt/fsx/fsx/global_csv --output_dir {args.npz_dir}")
+        print(f"  python preprocess_data.py --data_root {cfg['data_root']} --output_dir {npz_dir}")
         return
-
-    # Load config
-    with open(args.config, 'r') as f:
-        cfg = json.load(f)
-
-    print(f"Loaded config from {args.config}")
 
     os.makedirs(cfg["save_dir"], exist_ok=True)
     with open(os.path.join(cfg["save_dir"], "config.json"), "w") as f:
@@ -152,9 +159,9 @@ def main():
     print(f"Using device: {device}")
 
     # Create data loaders from preprocessed NPZ (FAST!)
-    print(f"\nLoading preprocessed data from: {args.npz_dir}")
+    print(f"\nLoading preprocessed data from: {npz_dir}")
     _, val_loader, test_loader = create_loaders_from_npz(
-        args.npz_dir, cfg, cfg["data_root"],
+        npz_dir, cfg, cfg["data_root"],
         noise_std_skeleton_mm=0.0,
         noise_std_robot_mm=0.0,
         noise_spike_prob=0.0,
@@ -175,6 +182,18 @@ def main():
     print(f"\nModel created: input_dim={skeleton_dim}, output_dim=12")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Setup logging
+    log_file = os.path.join(cfg["save_dir"], f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    log_writer = csv.writer(open(log_file, 'w', newline=''))
+    log_writer.writerow(['phase', 'epoch', 'train_loss', 'val_loss', 'learning_rate', 'time_elapsed'])
+    print(f"\nLogging to: {log_file}")
+
+    # Storage for plotting
+    train_losses_phase1 = []
+    val_losses_phase1 = []
+    train_losses_phase2 = []
+    val_losses_phase2 = []
+
     # ========== Phase 1: Frame-level training ==========
     print("\n" + "="*60)
     print("Phase 1: Frame-level training with teacher forcing")
@@ -182,7 +201,7 @@ def main():
 
     crit = EndpointLoss(cfg["first_w"], cfg["smooth_vel_w"], cfg["smooth_acc_w"])
     opt = optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=1e-5)
-    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8, verbose=True)
+    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8)
 
     best = float("inf")
     best_path = os.path.join(cfg["save_dir"], "best_model.pth")
@@ -196,7 +215,7 @@ def main():
 
         # Recreate train_loader with updated noise (FAST with NPZ!)
         train_loader, _, _ = create_loaders_from_npz(
-            args.npz_dir, cfg, cfg["data_root"],
+            npz_dir, cfg, cfg["data_root"],
             noise_std_skeleton_mm=noise_std_skel,
             noise_std_robot_mm=noise_std_robot,
             noise_spike_prob=spike_prob,
@@ -212,6 +231,14 @@ def main():
         tr = train_one_epoch(model, train_loader, opt, crit, device, epoch, cfg["num_epochs"])
         va = validate(model, val_loader, crit, device, epoch, cfg["num_epochs"])
         sched.step(va)
+
+        # Log to CSV
+        log_writer.writerow(['phase1', epoch, tr, va, opt.param_groups[0]['lr'], time.time()-t0])
+
+        # Store for plotting
+        train_losses_phase1.append(tr)
+        val_losses_phase1.append(va)
+
         print(f"[Phase1][Epoch {epoch:03d}] train={tr:.6f}  val={va:.6f}  lr={opt.param_groups[0]['lr']:.2e}")
 
         if va < best:
@@ -279,6 +306,13 @@ def main():
 
         val_loss = validate(model, val_loader, crit, device, epoch, traj_epochs)
 
+        # Log to CSV
+        log_writer.writerow(['phase2', epoch, traj_loss, val_loss, traj_opt.param_groups[0]['lr'], time.time()-t0])
+
+        # Store for plotting
+        train_losses_phase2.append(traj_loss)
+        val_losses_phase2.append(val_loss)
+
         print(f"[Phase2][Epoch {epoch:03d}] traj_loss={traj_loss:.6f}  val={val_loss:.6f}  lr={traj_opt.param_groups[0]['lr']:.2e}")
 
         if val_loss < traj_best:
@@ -287,9 +321,43 @@ def main():
             print(f"[Phase2] Saved best trajectory model to {traj_best_path} (val={traj_best:.6f})")
 
     print(f"\nPhase 2 done. Best traj val={traj_best:.6f}. Total elapsed {time.time()-t0:.1f}s.")
+
+    # ========== Plot Training Curves ==========
+    print("\nGenerating training curves...")
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+    # Phase 1 plot
+    epochs_p1 = range(1, len(train_losses_phase1) + 1)
+    axes[0].plot(epochs_p1, train_losses_phase1, 'b-', label='Train Loss', linewidth=2)
+    axes[0].plot(epochs_p1, val_losses_phase1, 'r-', label='Val Loss', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss', fontsize=12)
+    axes[0].set_title('Phase 1: Frame-level Training', fontsize=14, fontweight='bold')
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+
+    # Phase 2 plot
+    if len(train_losses_phase2) > 0:
+        epochs_p2 = range(1, len(train_losses_phase2) + 1)
+        axes[1].plot(epochs_p2, train_losses_phase2, 'b-', label='Train Loss', linewidth=2)
+        axes[1].plot(epochs_p2, val_losses_phase2, 'r-', label='Val Loss', linewidth=2)
+        axes[1].set_xlabel('Epoch', fontsize=12)
+        axes[1].set_ylabel('Loss', fontsize=12)
+        axes[1].set_title('Phase 2: Trajectory-level Training', fontsize=14, fontweight='bold')
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(cfg["save_dir"], "training_curves.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Training curves saved to: {plot_path}")
+
     print("\nTraining completed! Models saved:")
     print(f"  - Frame-level best: {best_path}")
     print(f"  - Trajectory-level best: {traj_best_path}")
+    print(f"  - Training log: {log_file}")
+    print(f"  - Training curves: {plot_path}")
 
     # Save test loader info
     test_info = {

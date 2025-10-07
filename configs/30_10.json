@@ -1,5 +1,6 @@
 {
   "data_root": "/mnt/fsx/fsx/global_csv",
+  "npz_dir": "/home/ia-dev/oliver/robot_planner/preprocessed",
   "save_dir": "./checkpoints_30_10",
 
   "batch_size": 256,
@@ -8,7 +9,7 @@
   "train_ratio": 0.8,
   "val_ratio": 0.1,
   "test_ratio": 0.1,
-  "num_workers": 12,
+  "num_workers": 4,
 
   "hidden_dim": 256,
   "num_layers": 4,
