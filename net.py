@@ -30,7 +30,7 @@ class PositionalEncoding(nn.Module):
 class MotionTransformer(nn.Module):
     """Transformer-based motion prediction model"""
     def __init__(self,
-                 skeleton_dim=63,
+                 skeleton_dim=39,
                  output_dim=12,
                  hidden_dim=256,
                  num_layers=4,
@@ -138,7 +138,7 @@ class MotionTransformer(nn.Module):
         return self.output_to_hidden(output)
 
 
-def get_model(skeleton_dim=63, output_dim=12, hidden_dim=256, num_layers=4, num_heads=8, dropout=0.1):
+def get_model(skeleton_dim=39, output_dim=12, hidden_dim=256, num_layers=4, num_heads=8, dropout=0.1):
     """Factory function to create the model"""
     return MotionTransformer(
         skeleton_dim=skeleton_dim,
