@@ -563,8 +563,8 @@ def main(args=None):
     rclpy.init(args=args)
 
     # Model and config paths
-    model_path = os.path.join(os.path.dirname(__file__), 'checkpoints_csv_trajectory', 'best_model.pth')
-    config_path = os.path.join(os.path.dirname(__file__), 'configs', 'csv_trajectory.json')
+    model_path = os.path.join(os.path.dirname(__file__), 'checkpoints_30_10', 'best_model.pth')
+    config_path = os.path.join(os.path.dirname(__file__), 'configs', '30_10.json')
 
     if not os.path.exists(model_path):
         print(f"Error: Model file not found at {model_path}")
