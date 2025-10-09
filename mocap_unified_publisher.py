@@ -13,7 +13,7 @@ import struct
 
 
 class MocapUnifiedPublisher(Node):
-    def __init__(self, csv_file, traj_idx=0, frame_rate=120.0, pointcloud_dir=None):
+    def __init__(self, csv_file, traj_idx="0", frame_rate=120.0, pointcloud_dir=None):
         super().__init__('mocap_unified_publisher')
 
         # Create publishers
@@ -28,7 +28,22 @@ class MocapUnifiedPublisher(Node):
 
         # Load data
         self.df = pd.read_csv(csv_file)
-        self.traj_data = self.df[self.df['traj_id'] == traj_idx].copy()  # Changed from 'traj_idx' to 'traj_id'
+
+        # Handle both numeric and string traj_id
+        # If traj_idx is numeric string like "0", try to find by index in unique traj_ids
+        all_traj_ids = self.df['traj_id'].unique()
+        if traj_idx.isdigit():
+            traj_idx_num = int(traj_idx)
+            if traj_idx_num < len(all_traj_ids):
+                actual_traj_id = all_traj_ids[traj_idx_num]
+                self.get_logger().info(f'Using trajectory index {traj_idx_num}: {actual_traj_id}')
+                self.traj_data = self.df[self.df['traj_id'] == actual_traj_id].copy()
+            else:
+                self.get_logger().error(f'Trajectory index {traj_idx_num} out of range (max: {len(all_traj_ids)-1})')
+                self.traj_data = pd.DataFrame()
+        else:
+            # traj_idx is a string, match directly
+            self.traj_data = self.df[self.df['traj_id'] == traj_idx].copy()
 
         if self.traj_data.empty:
             self.get_logger().error(f'No data found for trajectory {traj_idx}')
@@ -109,7 +124,7 @@ class MocapUnifiedPublisher(Node):
 
         self.get_logger().info(
             f'Published unified data for frame {self.current_frame} '
-            f'(traj {int(row["traj_id"])}, frame {int(row["frame_id"])})'
+            f'(traj {row["traj_id"]}, frame {int(row["frame_id"])})'
         )
         
         self.current_frame += 1
@@ -428,7 +443,7 @@ class MocapUnifiedPublisher(Node):
         status.hardware_id = "mocap_unified_publisher"
 
         status.values = [
-            KeyValue(key="traj_id", value=str(int(row["traj_id"]))),
+            KeyValue(key="traj_id", value=str(row["traj_id"])),
             KeyValue(key="frame_id_csv", value=str(int(row["frame_id"]))),
             KeyValue(key="frame_idx_loop", value=str(self.current_frame)),
             KeyValue(key="fps", value=str(1.0 / self.publish_interval))
@@ -496,11 +511,11 @@ def main(args=None):
     # Parse command line arguments
     if len(sys.argv) < 2:
         print("Usage: python3 mocap_unified_publisher.py <csv_file> [traj_id] [frame_rate] [pointcloud_dir]")
-        print("Example: python3 mocap_unified_publisher.py inference_trajectory_gt.csv 0 10.0 /home/oliver/Documents/data/Mocap/train")
+        print("Example: python3 mocap_unified_publisher.py inference_trajectory_gt_test.csv 3 10.0 /home/oliver/Documents/data/Mocap_dataset/test")
         return
 
     csv_file = sys.argv[1]
-    traj_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    traj_idx = sys.argv[2] if len(sys.argv) > 2 else "0"  # Keep as string to support both numeric and string traj_ids
     frame_rate = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0  # Default to 10fps for CSV trajectory data
     pointcloud_dir = sys.argv[4] if len(sys.argv) > 4 else None
 
