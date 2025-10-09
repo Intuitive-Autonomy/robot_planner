@@ -25,8 +25,8 @@
   "traj_batch_size": 64,
   "traj_learning_rate": 0.00003,
   "traj_epochs": 10,
-  "traj_velocity_w": 1.0,
-  "traj_acceleration_w": 2.0,
-  "traj_jerk_w": 3.0,
+  "traj_velocity_w": 0.3,
+  "traj_acceleration_w": 0.5,
+  "traj_jerk_w": 0.7,
   "traj_max_speed_mm_s": 300.0
 }

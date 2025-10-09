@@ -207,7 +207,7 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description='Test model on augmented data')
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_traj_model.pth',
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints_30_10/best_traj_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use for inference')

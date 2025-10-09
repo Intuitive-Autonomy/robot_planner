@@ -34,8 +34,11 @@ class RobotPlanner(Node):
         # Model parameters
         self.sequence_length = self.config['sequence_length']  # 10 frames
         self.prediction_length = self.config['prediction_length']  # 5 frames
-        self.skeleton_dim = 27  # 9 upper body joints * 3 coordinates
+        self.skeleton_dim = 39  # 9 upper body joints * 3 + 4 robot endpoints * 3
         self.output_dim = 12   # 4 arm endpoints * 3 coordinates
+
+        # Initialize robot position buffer (stores current robot arm positions)
+        self.current_robot_pos = np.zeros((4, 3))  # [4 endpoints, 3 coords]
 
         # Load trained model
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -107,6 +110,9 @@ class RobotPlanner(Node):
                 predicted_arms = self.predict_arm_positions()
 
                 if predicted_arms is not None:
+                    # Update current robot position for next prediction (use first predicted frame)
+                    self.current_robot_pos = predicted_arms[0].copy()  # [4, 3]
+
                     # Transform back to ROS coordinate system
                     ros_arm_positions = self.transform_model_to_ros(predicted_arms)
 
@@ -184,11 +190,20 @@ class RobotPlanner(Node):
             dummy_arms = np.zeros((self.sequence_length, 4, 3))
             normalized_joints, _ = normalize_to_torso(sequence, dummy_arms)
 
-            # Flatten to model input format: [seq_len, 27]
-            model_input = normalized_joints.reshape(self.sequence_length, -1)
+            # Flatten joints: [seq_len, 27]
+            joints_flat = normalized_joints.reshape(self.sequence_length, -1)
+
+            # Normalize current robot position relative to torso (use last frame's torso)
+            torso_pos = sequence[-1, 8, :]  # Last frame's torso position [3]
+            robot_pos_normalized = self.current_robot_pos - torso_pos[None, :]  # [4, 3]
+            robot_pos_flat = robot_pos_normalized.reshape(-1)  # [12]
+
+            # Concatenate: [seq_len, 27 + 12] -> [seq_len, 39]
+            robot_pos_tiled = np.tile(robot_pos_flat, (self.sequence_length, 1))  # [seq_len, 12]
+            model_input = np.concatenate([joints_flat, robot_pos_tiled], axis=1)  # [seq_len, 39]
 
             # Convert to tensor
-            input_tensor = torch.FloatTensor(model_input).unsqueeze(0).to(self.device)  # [1, seq_len, 27]
+            input_tensor = torch.FloatTensor(model_input).unsqueeze(0).to(self.device)  # [1, seq_len, 39]
 
             # Model inference
             with torch.no_grad():
@@ -310,8 +325,8 @@ def main(args=None):
     rclpy.init(args=args)
 
     # Model and config paths
-    model_path = os.path.join(os.path.dirname(__file__), 'checkpoints_csv_trajectory', 'best_model.pth')
-    config_path = os.path.join(os.path.dirname(__file__), 'configs', 'csv_trajectory.json')
+    model_path = os.path.join(os.path.dirname(__file__), 'checkpoints_30_10', 'best_model.pth')
+    config_path = os.path.join(os.path.dirname(__file__), 'configs', '30_10.json')
 
     if not os.path.exists(model_path):
         print(f"Error: Model file not found at {model_path}")
