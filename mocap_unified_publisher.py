@@ -13,8 +13,11 @@ import struct
 
 
 class MocapUnifiedPublisher(Node):
-    def __init__(self, csv_file, traj_idx="0", frame_rate=120.0, pointcloud_dir=None):
+    def __init__(self, csv_file, traj_idx="0", frame_rate=120.0, pointcloud_dir=None, max_points=5000):
         super().__init__('mocap_unified_publisher')
+
+        # Point cloud downsampling parameter
+        self.max_points = max_points
 
         # Create publishers
         self.arm_publisher = self.create_publisher(PoseArray, '/demo_target_poses', 10)
@@ -468,15 +471,25 @@ class MocapUnifiedPublisher(Node):
             data = np.load(pointcloud_file)
             points = data['arr_0'].astype(np.float32)  # Convert from float16 to float32
 
+            # Downsample if too many points (for performance at high frame rates)
+            original_count = len(points)
+            if len(points) > self.max_points:
+                indices = np.random.choice(len(points), self.max_points, replace=False)
+                points = points[indices]
+                if self.current_frame == 0:  # Only log once at start
+                    self.get_logger().info(f'Downsampling pointcloud: {original_count} -> {self.max_points} points')
+
             # Convert from millimeters to meters
             points = points / 1000.0
 
             # Apply coordinate transformation (rotate -90 degrees around X-axis)
             # Transform each point: (x, y, z) -> (x, -z, y)
-            transformed_points = np.zeros_like(points)
-            transformed_points[:, 0] = points[:, 0]  # x unchanged
-            transformed_points[:, 1] = -points[:, 2]  # y = -z
-            transformed_points[:, 2] = points[:, 1]   # z = y
+            # Use advanced indexing for faster transformation
+            transformed_points = np.column_stack([
+                points[:, 0],      # x unchanged
+                -points[:, 2],     # y = -z
+                points[:, 1]       # z = y
+            ])
 
             # Create PointCloud2 message
             pointcloud_msg = PointCloud2()
@@ -496,8 +509,9 @@ class MocapUnifiedPublisher(Node):
             pointcloud_msg.point_step = 12  # 4 bytes * 3 fields
             pointcloud_msg.row_step = pointcloud_msg.point_step * pointcloud_msg.width
 
-            # Pack point data
-            pointcloud_msg.data = struct.pack(f'{len(transformed_points) * 3}f', *transformed_points.flatten())
+            # Pack point data using tobytes() - MUCH faster than struct.pack
+            # Ensure C-contiguous array for efficient conversion
+            pointcloud_msg.data = np.ascontiguousarray(transformed_points, dtype=np.float32).tobytes()
 
             # Publish pointcloud
             self.pointcloud_publisher.publish(pointcloud_msg)
@@ -510,17 +524,21 @@ def main(args=None):
     
     # Parse command line arguments
     if len(sys.argv) < 2:
-        print("Usage: python3 mocap_unified_publisher.py <csv_file> [traj_id] [frame_rate] [pointcloud_dir]")
+        print("Usage: python3 mocap_unified_publisher.py <csv_file> [traj_id] [frame_rate] [pointcloud_dir] [max_points]")
         print("Example: python3 mocap_unified_publisher.py inference_trajectory_gt_test.csv 3 10.0 /home/oliver/Documents/data/Mocap_dataset/test")
+        print("         python3 mocap_unified_publisher.py inference_trajectory_gt_test.csv 3 30.0 /home/oliver/Documents/data/Mocap_dataset/test 30000")
+        print("\nParameters:")
+        print("  max_points: Maximum points in pointcloud (default: 5000). Lower = faster but less detail")
         return
 
     csv_file = sys.argv[1]
     traj_idx = sys.argv[2] if len(sys.argv) > 2 else "0"  # Keep as string to support both numeric and string traj_ids
     frame_rate = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0  # Default to 10fps for CSV trajectory data
     pointcloud_dir = sys.argv[4] if len(sys.argv) > 4 else None
+    max_points = int(sys.argv[5]) if len(sys.argv) > 5 else 5000  # Default downsample to 50k points
 
     try:
-        publisher = MocapUnifiedPublisher(csv_file, traj_idx, frame_rate, pointcloud_dir)
+        publisher = MocapUnifiedPublisher(csv_file, traj_idx, frame_rate, pointcloud_dir, max_points)
         
         if publisher.traj_data.empty:
             return
@@ -532,7 +550,7 @@ def main(args=None):
         print("  - /skeleton_markers: Full body human skeleton visualization")
         print("  - /mocap_frame_info: Current traj id and frame id")
         if pointcloud_dir:
-            print("  - /human_pointcloud: Synchronized pointcloud data")
+            print(f"  - /human_pointcloud: Synchronized pointcloud data (max {max_points} points)")
         print("Press Ctrl+C to stop...")
         
         rclpy.spin(publisher)
