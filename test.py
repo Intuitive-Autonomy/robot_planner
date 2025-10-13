@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Test script for augmented data model
+Test script for 4-stage trained model with phase prediction
 - Loads best model from checkpoint
-- Randomly selects a trajectory from test set
+- Randomly selects a trajectory from test CSV
 - Performs inference with sliding window
+- Evaluates robot endpoint accuracy and phase prediction
 - Visualizes prediction vs ground truth in real-time 3D animation
 """
 
@@ -18,90 +19,218 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from net import get_model
-from utils import AugmentedDataProcessor
+from utils import normalize_to_torso
+import pandas as pd
 
 
-def load_model_and_config(checkpoint_path):
-    """Load trained model and configuration"""
+def load_csv_trajectories(csv_file, use_gt=True):
+    """Load all trajectories from CSV file
+
+    Args:
+        csv_file: Path to CSV file
+        use_gt: If True, load GT data (_gt suffix), else load Pred data (_pred suffix)
+    """
+    df = pd.read_csv(csv_file)
+    traj_ids = df['traj_id'].unique()
+
+    trajectories = []
+    joint_names = ['Head', 'Neck', 'R_Shoulder', 'L_Shoulder',
+                   'R_Elbow', 'L_Elbow', 'R_Hand', 'L_Hand', 'Torso']
+
+    suffix = '_gt' if use_gt else '_pred'
+
+    for traj_id in traj_ids:
+        traj_df = df[df['traj_id'] == traj_id].sort_values('frame_id').reset_index(drop=True)
+
+        # Extract joints [T, 27]
+        joint_cols = []
+        for jname in joint_names:
+            joint_cols.extend([f'{jname}{suffix}_x', f'{jname}{suffix}_y', f'{jname}{suffix}_z'])
+        joints = traj_df[joint_cols].values.astype(np.float32)
+
+        # Extract arms [T, 12]
+        arm_cols = ['Left_L1_x', 'Left_L1_y', 'Left_L1_z',
+                   'Left_L2_x', 'Left_L2_y', 'Left_L2_z',
+                   'Right_R1_x', 'Right_R1_y', 'Right_R1_z',
+                   'Right_R2_x', 'Right_R2_y', 'Right_R2_z']
+        arms = traj_df[arm_cols].values.astype(np.float32)
+
+        # Extract phases [T]
+        phase_col = f'phase{suffix}' if f'phase{suffix}' in traj_df.columns else 'phase_gt'
+        phases = traj_df[phase_col].values.astype(np.int64)
+
+        trajectories.append({
+            'traj_id': traj_id,
+            'joints': joints,
+            'arms': arms,
+            'phases': phases
+        })
+
+    return trajectories
+
+
+def load_model(checkpoint_path, cfg, device):
+    """Load trained model from checkpoint"""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    cfg = checkpoint['config']
 
-    # Create model
+    # Create model with same architecture
     model = get_model(
-        hidden_dim=cfg["hidden_dim"],
-        num_layers=cfg["num_layers"],
-        dropout=cfg["dropout"],
         skeleton_dim=39,
         output_dim=12,
-        num_heads=cfg["num_heads"]
-    )
+        hidden_dim=cfg['hidden_dim'],
+        num_layers=cfg['num_layers'],
+        num_heads=cfg['num_heads'],
+        dropout=cfg['dropout']
+    ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    print(f"Loaded model from {checkpoint_path}")
-    return model, cfg
+    stage = checkpoint.get('stage', 'unknown')
+    epoch = checkpoint.get('epoch', 'unknown')
+    print(f"Loaded model from {checkpoint_path} (Stage {stage}, Epoch {epoch})")
+
+    return model
 
 
 @torch.no_grad()
-def predict_trajectory(model, inputs, sequence_length, prediction_length, device):
+def predict_trajectory(model, joints, arms, sequence_length, device):
     """
     Predict full trajectory using sliding window with step=1
-    Takes only the first predicted frame from each window for smooth output
 
     Args:
         model: Trained model
-        inputs: [T, 39] input sequence
+        joints: [T, 27] joint positions in world coordinates
+        arms: [T, 12] arm positions in world coordinates
         sequence_length: Length of input window
-        prediction_length: Length of prediction window (but only first frame is used)
         device: Device to run on
 
     Returns:
-        predictions: [T, 12] predicted robot endpoints
+        pred_arms: [T-seq_len+1, 12] predicted robot endpoints in world coordinates
+        pred_phases: [T-seq_len+1] predicted phase labels (argmax)
+        phase_probs: [T-seq_len+1, 3] predicted phase probabilities
+        torso_positions: [T-seq_len+1, 3] torso positions for visualization
     """
     model.to(device)
     model.eval()
 
-    T = inputs.shape[0]
-    predictions = []
+    T = joints.shape[0]
+    pred_arms_list = []
+    pred_phases_list = []
+    phase_probs_list = []
+    torso_positions_list = []
 
-    # Sliding window prediction with step=1 (only take first predicted frame)
+    # Reshape joints and arms for normalize_to_torso
+    joints_3d = joints.reshape(T, 9, 3)  # [T, 9, 3]
+    arms_3d = arms.reshape(T, 4, 3)      # [T, 4, 3]
+
+    # Sliding window prediction with step=1
     for start_idx in range(0, T - sequence_length + 1):
         # Get input window
-        input_window = inputs[start_idx:start_idx + sequence_length]
-        input_tensor = torch.from_numpy(input_window).unsqueeze(0).float().to(device)
+        window_joints = joints_3d[start_idx:start_idx + sequence_length]  # [seq_len, 9, 3]
+        window_arms = arms_3d[start_idx:start_idx + sequence_length]      # [seq_len, 4, 3]
+
+        # Normalize to torso coordinate system (like in training)
+        normalized_joints, normalized_arms = normalize_to_torso(window_joints, window_arms)
+
+        # Flatten and concatenate: [seq_len, 27+12=39]
+        normalized_joints_flat = normalized_joints.reshape(sequence_length, -1)  # [seq_len, 27]
+        normalized_arms_flat = normalized_arms.reshape(sequence_length, -1)      # [seq_len, 12]
+        input_seq = np.concatenate([normalized_joints_flat, normalized_arms_flat], axis=1)  # [seq_len, 39]
+
+        # Convert to tensor
+        input_tensor = torch.from_numpy(input_seq).unsqueeze(0).float().to(device)
 
         # Predict next frame (pred_len=1 for single-step prediction)
-        pred = model(input_tensor, pred_len=1, teacher_forcing_ratio=0.0)
-        pred_np = pred.squeeze(0).cpu().numpy()  # [1, 12]
+        pred_robot, pred_phase_logits = model(input_tensor, pred_len=1,
+                                              autoregressive=False,
+                                              return_phase=True)
 
-        predictions.append(pred_np)
+        # Convert to numpy
+        pred_robot_np = pred_robot.squeeze(0).cpu().numpy()  # [1, 12]
+        pred_phase_logits_np = pred_phase_logits.squeeze(0).cpu().numpy()  # [1, 3]
+
+        # Get phase prediction
+        phase_probs = torch.softmax(pred_phase_logits, dim=-1).squeeze(0).cpu().numpy()  # [1, 3]
+        phase_label = np.argmax(pred_phase_logits_np, axis=-1)  # [1]
+
+        # Transform prediction back to world coordinates
+        # Get torso position at the end of the window (last frame)
+        torso_pos = window_joints[-1, 8, :]  # [3] - Torso is joint index 8
+        pred_robot_world = pred_robot_np.reshape(1, 4, 3) + torso_pos[None, None, :]  # Add torso offset
+        pred_robot_world_flat = pred_robot_world.reshape(1, 12)  # [1, 12]
+
+        pred_arms_list.append(pred_robot_world_flat)
+        pred_phases_list.append(phase_label)
+        phase_probs_list.append(phase_probs)
+        torso_positions_list.append(torso_pos)
 
     # Concatenate predictions
-    predictions = np.concatenate(predictions, axis=0)  # [T-sequence_length+1, 12]
+    pred_arms = np.concatenate(pred_arms_list, axis=0)  # [T-seq_len+1, 12]
+    pred_phases = np.concatenate(pred_phases_list, axis=0)  # [T-seq_len+1]
+    phase_probs = np.concatenate(phase_probs_list, axis=0)  # [T-seq_len+1, 3]
+    torso_positions = np.array(torso_positions_list)  # [T-seq_len+1, 3]
 
-    return predictions
+    return pred_arms, pred_phases, phase_probs, torso_positions
 
 
-def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
+def evaluate_metrics(pred_arms, pred_phases, gt_arms, gt_phases):
+    """
+    Evaluate prediction metrics
+
+    Returns:
+        metrics: dict with MSE, phase accuracy, illegal transition ratio
+    """
+    # Robot endpoint MSE
+    mse = np.mean((pred_arms - gt_arms) ** 2)
+
+    # Phase accuracy
+    phase_acc = np.mean(pred_phases == gt_phases)
+
+    # Illegal transitions
+    illegal_transitions = {(0, 2), (1, 0), (2, 0), (2, 1)}
+    n_transitions = len(pred_phases) - 1
+    n_illegal = 0
+
+    for t in range(n_transitions):
+        if (int(pred_phases[t]), int(pred_phases[t+1])) in illegal_transitions:
+            n_illegal += 1
+
+    illegal_ratio = n_illegal / max(1, n_transitions)
+
+    return {
+        'mse': mse,
+        'phase_acc': phase_acc,
+        'illegal_ratio': illegal_ratio,
+        'n_illegal': n_illegal,
+        'n_transitions': n_transitions
+    }
+
+
+def visualize_prediction_3d(gt_arms, pred_arms, joints, gt_phases, pred_phases):
     """
     Real-time 3D animation visualization of prediction vs ground truth
 
     Args:
-        gt_traj: [T, 12] ground truth robot endpoints
-        pred_traj: [T, 12] predicted robot endpoints
-        joints_traj: [T, 27] human joints for context
-        save_path: Optional path to save animation (not used, for interface compatibility)
+        gt_arms: [T, 12] ground truth robot endpoints
+        pred_arms: [T, 12] predicted robot endpoints
+        joints: [T, 27] human joints for context
+        gt_phases: [T] ground truth phase labels
+        pred_phases: [T] predicted phase labels
     """
     # Reshape data
-    gt_pts = gt_traj.reshape(-1, 4, 3)      # [T, 4, 3]
-    pred_pts = pred_traj.reshape(-1, 4, 3)  # [T, 4, 3]
-    joints = joints_traj.reshape(-1, 9, 3)  # [T, 9, 3]
+    gt_pts = gt_arms.reshape(-1, 4, 3)      # [T, 4, 3]
+    pred_pts = pred_arms.reshape(-1, 4, 3)  # [T, 4, 3]
+    joints_3d = joints.reshape(-1, 9, 3)    # [T, 9, 3]
 
     T = gt_pts.shape[0]
+
+    # Phase names
+    phase_names = ['Approaching', 'Assisting', 'Leaving']
+    phase_colors = ['green', 'blue', 'orange']
 
     # Joint connections for visualization
     joint_connections = [
@@ -119,11 +248,11 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
     arm_connections = [(0, 1), (2, 3)]  # [lback-lfront, rback-rfront]
 
     # Setup figure
-    fig = plt.figure(figsize=(14, 10))
+    fig = plt.figure(figsize=(16, 10))
     ax = fig.add_subplot(111, projection='3d')
 
     # Calculate plot limits
-    all_points = np.concatenate([gt_pts.reshape(-1, 3), joints.reshape(-1, 3)], axis=0)
+    all_points = np.concatenate([gt_pts.reshape(-1, 3), joints_3d.reshape(-1, 3)], axis=0)
     max_range = np.array([
         all_points[:, 0].max() - all_points[:, 0].min(),
         all_points[:, 1].max() - all_points[:, 1].min(),
@@ -145,11 +274,11 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
 
         # Draw human skeleton (gray)
         for conn in joint_connections:
-            p1, p2 = joints[frame, conn[0]], joints[frame, conn[1]]
+            p1, p2 = joints_3d[frame, conn[0]], joints_3d[frame, conn[1]]
             ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
                    'gray', linewidth=2, alpha=0.5)
 
-        ax.scatter(joints[frame, :, 0], joints[frame, :, 1], joints[frame, :, 2],
+        ax.scatter(joints_3d[frame, :, 0], joints_3d[frame, :, 1], joints_3d[frame, :, 2],
                   c='gray', s=30, alpha=0.5, label='Human Skeleton')
 
         # Draw ground truth robot arms (blue)
@@ -173,6 +302,16 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
         # Calculate MSE for current frame
         mse = np.mean((gt_pts[frame] - pred_pts[frame])**2)
 
+        # Get phase info
+        gt_phase = int(gt_phases[frame])
+        pred_phase = int(pred_phases[frame])
+        phase_match = '✓' if gt_phase == pred_phase else '✗'
+
+        # Add phase visualization text box
+        phase_text = (f'GT: {phase_names[gt_phase]} | '
+                     f'Pred: {phase_names[pred_phase]} {phase_match}')
+        phase_color = phase_colors[pred_phase]
+
         # Set labels and title
         ax.set_xlabel('X (mm)', fontsize=10, fontweight='bold')
         ax.set_ylabel('Y (Up, mm)', fontsize=10, fontweight='bold')
@@ -180,6 +319,11 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
         ax.set_title(f'Frame {frame+1}/{T} - MSE: {mse:.2f} mm²\n'
                     f'Blue: Ground Truth | Red: Prediction',
                     fontsize=12, fontweight='bold')
+
+        # Add phase info text box at top
+        ax.text2D(0.5, 0.95, phase_text, transform=ax.transAxes,
+                 fontsize=14, fontweight='bold', ha='center', va='top',
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor=phase_color, alpha=0.3, edgecolor='black', linewidth=2))
 
         # Set consistent axis limits
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
@@ -206,114 +350,97 @@ def visualize_prediction_3d(gt_traj, pred_traj, joints_traj, save_path=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Test model on augmented data')
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints_30_10/best_traj_model.pth',
-                       help='Path to model checkpoint')
+    parser = argparse.ArgumentParser(description='Test 4-stage trained model')
+    parser.add_argument('--config', type=str, default='configs/30_10.json',
+                       help='Path to config file')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                       help='Path to model checkpoint (default: uses save_dir from config)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use for inference')
     parser.add_argument('--traj_id', type=int, default=None,
                        help='Specific trajectory ID to visualize (default: random)')
+    parser.add_argument('--use_pred', action='store_true',
+                       help='Use predicted data instead of GT data for testing')
 
     args = parser.parse_args()
 
-    # Load model and config
-    model, cfg = load_model_and_config(args.checkpoint)
+    # Load config
+    with open(args.config, 'r') as f:
+        cfg = json.load(f)
+
+    print(f"Loaded config from {args.config}")
+
+    # Determine checkpoint path - use latest stage model
+    if args.checkpoint is None:
+        # Try to find the latest stage model (4 > 3 > 2 > 1)
+        save_dir = cfg['save_dir']
+        for stage in [4, 3, 2, 1]:
+            stage_ckpt = os.path.join(save_dir, f'best_model_stage{stage}.pth')
+            if os.path.exists(stage_ckpt):
+                args.checkpoint = stage_ckpt
+                break
+        else:
+            # Fallback to old naming
+            args.checkpoint = os.path.join(save_dir, 'best_model.pth')
+
+    # Load model
     device = torch.device(args.device)
+    model = load_model(args.checkpoint, cfg, device)
 
-    # Load test info
-    test_info_path = os.path.join(os.path.dirname(args.checkpoint), "test_info.json")
-    if os.path.exists(test_info_path):
-        with open(test_info_path, 'r') as f:
-            test_info = json.load(f)
-        print(f"Loaded test info from {test_info_path}")
+    # Load test CSV (use pred or gt based on flag)
+    if args.use_pred:
+        test_csv = cfg['test_csv_pred']
+        data_type = 'Predicted'
     else:
-        print("Warning: test_info.json not found, using default test split")
-        # Fallback to creating test split
-        processor = AugmentedDataProcessor(cfg["data_root"])
-        base_names = processor.get_base_names()
-        np.random.seed(42)
-        shuffled_bases = np.random.permutation(base_names).tolist()
-        n_total = len(shuffled_bases)
-        n_train = int(n_total * 0.8)
-        n_val = int(n_total * 0.1)
-        test_bases = shuffled_bases[n_train+n_val:]
-        test_info = {
-            "test_bases": test_bases,
-            "data_root": cfg["data_root"],
-            "sequence_length": cfg["sequence_length"],
-            "prediction_length": cfg["prediction_length"]
-        }
+        test_csv = cfg['test_csv_gt']
+        data_type = 'Ground Truth'
 
-    # Get test file paths
-    processor = AugmentedDataProcessor(test_info["data_root"])
-    file_groups = processor.file_groups
-    test_files = [f for base in test_info["test_bases"] for f in file_groups[base]]
+    if not os.path.exists(test_csv):
+        raise FileNotFoundError(f"Test CSV not found: {test_csv}")
 
-    print(f"\nTest set: {len(test_info['test_bases'])} base recordings ({len(test_files)} files)")
+    trajectories = load_csv_trajectories(test_csv, use_gt=not args.use_pred)
+    print(f"Loaded {len(trajectories)} test trajectories from {test_csv} ({data_type} data)")
 
-    # Randomly select a trajectory
-    if args.traj_id is not None and args.traj_id < len(test_files):
-        selected_file = test_files[args.traj_id]
-        print(f"Selected trajectory ID {args.traj_id}: {os.path.basename(selected_file)}")
+    # Select trajectory
+    if args.traj_id is not None and args.traj_id < len(trajectories):
+        traj = trajectories[args.traj_id]
+        print(f"Selected trajectory ID {args.traj_id}")
     else:
-        selected_file = random.choice(test_files)
-        print(f"Randomly selected: {os.path.basename(selected_file)}")
+        traj = random.choice(trajectories)
+        print(f"Randomly selected trajectory")
 
-    # Load trajectory data (normalized to torso)
-    inputs, targets = processor.load_trajectory_file(selected_file)
-    print(f"Trajectory length: {len(inputs)} frames (at 30fps)")
+    joints = traj['joints']  # [T, 27]
+    arms = traj['arms']      # [T, 12]
+    phases = traj['phases']  # [T]
 
-    # Extract joints for visualization (first 27 dims of inputs)
-    joints_normalized = inputs[:, :27]  # [T, 27]
+    print(f"Trajectory length: {len(joints)} frames")
 
-    # Extract torso position to restore world coordinates
-    # Torso is at index 8 in the 9 joints, which is dims 24-27 in the 27D vector
-    joints_3d = joints_normalized.reshape(-1, 9, 3)  # [T, 9, 3]
-    torso_pos = joints_3d[:, 8, :]  # [T, 3] - torso position (currently at origin)
-
-    # Load original data to get actual torso positions in world coordinates
-    inputs_world, targets_world = processor.load_trajectory_file(selected_file, normalize_to_torso_flag=False)
-    joints_world = inputs_world[:, :27].reshape(-1, 9, 3)
-    torso_world = joints_world[:, 8, :]  # [T, 3] - actual torso positions
-
-    print(f"Data coordinate system: normalized to torso (will restore to world coordinates for visualization)")
-
-    # Predict trajectory
-    print(f"Running inference with sequence_length={test_info['sequence_length']}, "
-          f"prediction_length={test_info['prediction_length']}...")
-
-    predictions = predict_trajectory(
-        model, inputs,
-        test_info["sequence_length"],
-        test_info["prediction_length"],
-        device
-    )
+    # Predict trajectory (with torso normalization)
+    seq_len = cfg['sequence_length']
+    print(f"Running inference with sequence_length={seq_len}...")
+    pred_arms, pred_phases, phase_probs, torso_positions = predict_trajectory(model, joints, arms, seq_len, device)
 
     # Align prediction and ground truth lengths
-    min_len = min(len(predictions), len(targets))
-    predictions = predictions[:min_len]
-    targets = targets[:min_len]
-    joints_normalized = joints_normalized[:min_len]
-    torso_world = torso_world[:min_len]
+    min_len = min(len(pred_arms), len(arms) - seq_len + 1)
+    pred_arms = pred_arms[:min_len]
+    pred_phases = pred_phases[:min_len]
+    gt_arms = arms[seq_len-1:seq_len-1+min_len]
+    gt_phases = phases[seq_len-1:seq_len-1+min_len]
+    joints_viz = joints[seq_len-1:seq_len-1+min_len]
 
-    # Restore to world coordinates by adding torso positions
-    # predictions and targets are in torso-relative coordinates, need to add torso_world
-    predictions_world = predictions.reshape(-1, 4, 3) + torso_world[:, None, :]  # [T, 4, 3]
-    targets_world = targets.reshape(-1, 4, 3) + torso_world[:, None, :]  # [T, 4, 3]
-    joints_world_viz = joints_normalized.reshape(-1, 9, 3) + torso_world[:, None, :]  # [T, 9, 3]
+    # Evaluate metrics
+    metrics = evaluate_metrics(pred_arms, pred_phases, gt_arms, gt_phases)
 
-    # Reshape back
-    predictions_world = predictions_world.reshape(-1, 12)
-    targets_world = targets_world.reshape(-1, 12)
-    joints_world_viz = joints_world_viz.reshape(-1, 27)
+    print(f"\n{'='*60}")
+    print(f"Evaluation Metrics:")
+    print(f"{'='*60}")
+    print(f"Robot MSE:          {metrics['mse']:.4f} mm²")
+    print(f"Phase Accuracy:     {metrics['phase_acc']*100:.2f}%")
+    print(f"Illegal Transitions: {metrics['n_illegal']}/{metrics['n_transitions']} ({metrics['illegal_ratio']*100:.2f}%)")
+    print(f"{'='*60}\n")
 
-    # Calculate overall MSE (in normalized coordinates for consistency)
-    mse = np.mean((predictions - targets)**2)
-    print(f"Overall MSE: {mse:.4f} mm²")
-    print(f"Visualizing {min_len} frames in world coordinates...")
-
-    # Visualize in world coordinates
-    visualize_prediction_3d(targets_world, predictions_world, joints_world_viz)
+    # Visualize
+    visualize_prediction_3d(gt_arms, pred_arms, joints_viz, gt_phases, pred_phases)
 
 
 if __name__ == "__main__":

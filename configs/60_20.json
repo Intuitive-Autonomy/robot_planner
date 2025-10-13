@@ -1,13 +1,14 @@
 {
   "data_root": "/home/oliver/Documents/data/Mocap/global_csv",
-  "save_dir": "./checkpoints",
+  "save_dir": "./checkpoints_60_20",
+  "train_csv_gt": "inference_trajectory_gt_train.csv",
+  "train_csv_pred": "inference_trajectory_train.csv",
+  "test_csv_gt": "inference_trajectory_gt_test.csv",
+  "test_csv_pred": "inference_trajectory_test.csv",
 
   "batch_size": 128,
   "sequence_length": 60,
   "prediction_length": 20,
-  "train_ratio": 0.8,
-  "val_ratio": 0.1,
-  "test_ratio": 0.1,
   "num_workers": 8,
 
   "hidden_dim": 256,
@@ -15,18 +16,35 @@
   "num_heads": 8,
   "dropout": 0.1,
 
-  "learning_rate": 0.0003,
-  "num_epochs": 40,
+  "stage1_epochs": 40,
+  "stage1_lr": 0.0003,
 
-  "first_w": 3.0,
+  "stage2_epochs": 20,
+  "stage2_lr": 0.0001,
+  "stage2_gt_ratio_start": 0.8,
+  "stage2_gt_ratio_end": 0.2,
+
+  "stage3_epochs": 20,
+  "stage3_lr": 0.00005,
+
+  "stage4_epochs": 20,
+  "stage4_lr": 0.00003,
+
+  "noise_start": 0.0,
+  "noise_mid": 25.0,
+  "noise_end": 50.0,
+  "noise_stage3": 70.0,
+  "rotate_prob": 1.0,
+  "time_scale_prob_max": 0.8,
+  "time_scale_prob_stage2_max": 0.5,
+  "initial_pos_prob_max": 0.5,
+  "initial_pos_prob_stage2_max": 0.3,
+
+  "robot_loss_w": 1.0,
+  "phase_loss_w": 0.5,
+  "coherence_loss_w": 0.3,
+  "speed_penalty_w": 0.2,
+  "max_speed_mm_per_frame": 10.0,
   "smooth_vel_w": 0.05,
-  "smooth_acc_w": 0.01,
-
-  "traj_batch_size": 64,
-  "traj_learning_rate": 0.00003,
-  "traj_epochs": 10,
-  "traj_velocity_w": 0.3,
-  "traj_acceleration_w": 0.5,
-  "traj_jerk_w": 0.7,
-  "traj_max_speed_mm_s": 300.0
+  "smooth_acc_w": 0.01
 }

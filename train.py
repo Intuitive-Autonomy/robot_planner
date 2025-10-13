@@ -1,504 +1,441 @@
 #!/usr/bin/env python3
-"""
-Augmented Data Training:
-- Input: [seq_len, 39] = 9 joints (27D) + 4 robot endpoints (12D)
-- Output: [pred_len, 12] = 4 robot arm endpoints
-- Data: augmented mocap data from global_csv (120fps -> 30fps)
-- Split: 8:1:1 train/val/test (no leakage across augmented versions)
-- Training: Two-phase (frame-level + trajectory-level)
-"""
+"""4-stage training with progressive augmentation and phase prediction"""
 
 import os
 import json
 import time
 import argparse
-import numpy as np
+import csv
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-
 from net import get_model
-from utils import create_augmented_data_loaders, AugmentedDataset, AugmentedDataProcessor
+from utils import CombinedLoss
 
 
-# ---------- Loss Functions ----------
-class EndpointLoss(nn.Module):
-    """
-    Frame-level loss for robot arm endpoints
-    - MSE on endpoint positions
-    - First frame weighting
-    - Smoothness regularization (velocity/acceleration)
-    """
-    def __init__(self,
-                 first_w: float = 3.0,
-                 smooth_vel_w: float = 0.05,
-                 smooth_acc_w: float = 0.01):
-        super().__init__()
-        self.first_w = first_w
-        self.sv = smooth_vel_w
-        self.sa = smooth_acc_w
-        self.mse = nn.MSELoss()
+class TrainingLogger:
+    """CSV logger for training metrics"""
+    def __init__(self, log_dir, config_name):
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_file = os.path.join(log_dir, f'training_log_{timestamp}.csv')
 
-    def forward(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-        """
-        pred, gt: [B, T, 12] - 4 robot endpoints × 3 coords
-        """
-        B, T, D = pred.shape
-        device = pred.device
+        self.fieldnames = ['timestamp', 'stage', 'epoch', 'phase', 'train_loss', 'val_loss',
+                          'robot_loss', 'phase_loss', 'lr', 'augmentation']
 
-        # 1) Endpoint position MSE
-        pos = self.mse(pred, gt)
+        with open(self.log_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
 
-        # 2) First frame extra weight
-        first = self.mse(pred[:, :1], gt[:, :1]) if T > 0 else torch.tensor(0.0, device=device)
+        print(f"Logging to: {self.log_file}")
 
-        # 3) Smoothness regularization
-        vel = ((pred[:, 1:] - pred[:, :-1])**2).mean() if T > 1 else torch.tensor(0.0, device=device)
-        acc = ((pred[:, 2:] - 2*pred[:, 1:-1] + pred[:, :-2])**2).mean() if T > 2 else torch.tensor(0.0, device=device)
-
-        total = pos + self.first_w * first + self.sv * vel + self.sa * acc
-        return total
+    def log(self, stage, epoch, phase, train_loss, val_loss, robot_loss, phase_loss, lr, aug_info=''):
+        """Log training metrics"""
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow({
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'stage': stage,
+                'epoch': epoch,
+                'phase': phase,
+                'train_loss': f'{train_loss:.6f}',
+                'val_loss': f'{val_loss:.6f}',
+                'robot_loss': f'{robot_loss:.6f}',
+                'phase_loss': f'{phase_loss:.6f}',
+                'lr': f'{lr:.6f}',
+                'augmentation': aug_info
+            })
 
 
-class TrajectoryJitterLoss(nn.Module):
-    """
-    Trajectory-level loss with jitter and speed penalties
-    Penalizes jerky motion and excessive speed
-    """
-    def __init__(self,
-                 velocity_w: float = 1.0,
-                 acceleration_w: float = 2.0,
-                 jerk_w: float = 3.0,
-                 max_speed_mm_per_s: float = 300.0,
-                 data_processor = None):
-        super().__init__()
-        self.velocity_w = velocity_w
-        self.acceleration_w = acceleration_w
-        self.jerk_w = jerk_w
-        self.max_speed_mm_s = max_speed_mm_per_s
-        self.base_fps = 30.0  # Fixed 30fps for augmented data
-        self.mse = nn.MSELoss()
+def get_augmentation_config(stage, epoch, total_stage_epochs, cfg):
+    """Get augmentation config for current stage and epoch"""
+    progress = epoch / max(1, total_stage_epochs)
 
-    def forward(self, pred_traj: torch.Tensor, gt_traj: torch.Tensor) -> torch.Tensor:
-        """
-        pred_traj, gt_traj: [B, T, 12] - full trajectory prediction
-        """
-        B, T, _ = pred_traj.shape
+    if stage == 1:
+        # Noise progression: 0→25mm→50mm in 1:1:2 ratio
+        third = total_stage_epochs // 3
+        if epoch < third:
+            noise_std = cfg['noise_start'] + (cfg['noise_mid'] - cfg['noise_start']) * (epoch / third)
+        elif epoch < 2 * third:
+            noise_std = cfg['noise_mid']
+        else:
+            noise_std = cfg['noise_mid'] + (cfg['noise_end'] - cfg['noise_mid']) * ((epoch - 2*third) / third)
 
-        # Base MSE loss
-        base_loss = self.mse(pred_traj, gt_traj)
+        return {'rotate_prob': cfg['rotate_prob'], 'time_scale_prob': 0.0,
+                'initial_pos_prob': 0.0, 'noise_std': noise_std}
 
-        if T < 2:
-            return base_loss
+    elif stage == 2:
+        # Progressive: time_scale (0→50%), initial_pos (0→30%)
+        return {'rotate_prob': cfg['rotate_prob'],
+                'time_scale_prob': cfg['time_scale_prob_stage2_max'] * progress,
+                'initial_pos_prob': cfg['initial_pos_prob_stage2_max'] * progress,
+                'noise_std': cfg['noise_end']}
 
-        max_speed_mm_per_frame = self.max_speed_mm_s / self.base_fps
+    elif stage in [3, 4]:
+        # Full augmentation
+        return {'rotate_prob': cfg['rotate_prob'],
+                'time_scale_prob': cfg['time_scale_prob_max'],
+                'initial_pos_prob': cfg['initial_pos_prob_max'],
+                'noise_std': cfg['noise_stage3']}
 
-        # Calculate velocity (1st order diff)
-        pred_vel = pred_traj[:, 1:] - pred_traj[:, :-1]  # [B, T-1, 12]
-        gt_vel = gt_traj[:, 1:] - gt_traj[:, :-1]
-
-        # Velocity loss
-        velocity_loss = self.mse(pred_vel, gt_vel)
-
-        # Speed penalty
-        pred_vel_points = pred_vel.view(B, T-1, 4, 3)  # [B, T-1, 4, 3]
-        pred_speeds = torch.norm(pred_vel_points, dim=-1)  # [B, T-1, 4] - mm/frame
-        speed_penalty = torch.relu(pred_speeds - max_speed_mm_per_frame).pow(2).mean()
-
-        total_loss = base_loss + self.velocity_w * velocity_loss + speed_penalty
-
-        if T < 3:
-            return total_loss
-
-        # Calculate acceleration (2nd order diff)
-        pred_acc = pred_vel[:, 1:] - pred_vel[:, :-1]  # [B, T-2, 12]
-        gt_acc = gt_vel[:, 1:] - gt_vel[:, :-1]
-
-        # Acceleration loss
-        acceleration_loss = self.mse(pred_acc, gt_acc)
-
-        total_loss += self.acceleration_w * acceleration_loss
-
-        if T < 4:
-            return total_loss
-
-        # Calculate jerk (3rd order diff)
-        pred_jerk = pred_acc[:, 1:] - pred_acc[:, :-1]  # [B, T-3, 12]
-        gt_jerk = gt_acc[:, 1:] - gt_acc[:, :-1]
-
-        # Jerk loss
-        jerk_loss = self.mse(pred_jerk, gt_jerk)
-
-        total_loss += self.jerk_w * jerk_loss
-
-        return total_loss
+    return {}
 
 
-class AugmentedFullTrajectoryDataset:
-    """Full trajectory dataset for Phase 2 training with augmented data"""
-    def __init__(self, file_paths, data_root, sequence_length=30, prediction_length=10):
-        self.file_paths = file_paths
-        self.data_root = data_root
-        self.sequence_length = sequence_length
-        self.prediction_length = prediction_length
-        self.trajectories = []
-
-        processor = AugmentedDataProcessor(data_root)
-
-        # Load all trajectories and create segments
-        for file_path in file_paths:
-            try:
-                inputs, targets = processor.load_trajectory_file(file_path)
-                min_length = sequence_length + prediction_length
-                if len(inputs) >= min_length:
-                    # Create multiple overlapping training segments
-                    for start_idx in range(0, len(inputs) - min_length + 1, prediction_length // 2):
-                        input_seq = inputs[start_idx:start_idx + sequence_length]
-                        target_seq = targets[start_idx + sequence_length:start_idx + sequence_length + prediction_length]
-                        self.trajectories.append((input_seq, target_seq))
-            except Exception as e:
-                print(f"Warning: Could not load {file_path}: {e}")
-                continue
-
-        print(f"Augmented Full Trajectory Dataset: {len(self.trajectories)} segments (fixed length: {prediction_length})")
-
-    def __len__(self):
-        return len(self.trajectories)
-
-    def __getitem__(self, idx):
-        input_seq, target_seq = self.trajectories[idx]
-        return torch.from_numpy(input_seq).float(), torch.from_numpy(target_seq).float()
-
-
-# ---------- Noise Scheduler ----------
-def get_progressive_noise_params(epoch, total_epochs):
-    """
-    Calculate progressive noise parameters based on current epoch
-
-    Stages ratio: 1:1:2 (e.g., 40 epochs = 10|10|20)
-    Stage 1: skeleton_std 0→10mm, robot_std 0→10mm
-    Stage 2: skeleton_std 10→30mm, robot_std 10→20mm
-    Stage 3: skeleton_std 30→50mm, robot_std 20→30mm + spike noise
-
-    Returns:
-        noise_std_skeleton_mm, noise_std_robot_mm, noise_spike_prob, noise_spike_magnitude_mm
-    """
-    # Stage ratio: 1:1:2
-    stage1_epochs = total_epochs // 4  # 1/4 of total
-    stage2_epochs = total_epochs // 4  # 1/4 of total
-    # stage3_epochs = total_epochs // 2  # 2/4 of total (remaining)
-
-    stage1_end = stage1_epochs
-    stage2_end = stage1_epochs + stage2_epochs
-
-    if epoch <= stage1_end:
-        # Stage 1: 0 to 10mm for both
-        progress = epoch / max(1, stage1_end)
-        noise_std_skeleton_mm = 0.0 + progress * 10.0
-        noise_std_robot_mm = 0.0 + progress * 10.0
-        noise_spike_prob = 0.0
-        noise_spike_magnitude_mm = 0.0
-    elif epoch <= stage2_end:
-        # Stage 2: skeleton 10→30mm, robot 10→20mm
-        progress = (epoch - stage1_end) / max(1, stage2_end - stage1_end)
-        noise_std_skeleton_mm = 10.0 + progress * 20.0
-        noise_std_robot_mm = 10.0 + progress * 10.0
-        noise_spike_prob = 0.0
-        noise_spike_magnitude_mm = 0.0
-    else:
-        # Stage 3: skeleton 30→50mm, robot 20→30mm + spike noise
-        progress = (epoch - stage2_end) / max(1, total_epochs - stage2_end)
-        noise_std_skeleton_mm = 30.0 + progress * 20.0
-        noise_std_robot_mm = 20.0 + progress * 10.0
-        noise_spike_prob = 0.3  # 30% chance to add spike noise
-        noise_spike_magnitude_mm = 200.0
-
-    return noise_std_skeleton_mm, noise_std_robot_mm, noise_spike_prob, noise_spike_magnitude_mm
-
-
-# ---------- Training Functions ----------
-def train_one_epoch(model, loader, opt, crit, device, epoch, num_epochs, base_tf=0.6, end_tf=0.0):
-    """Train one epoch with teacher forcing decay"""
+def train_one_epoch(model, loader, optimizer, criterion, device, epoch, stage, autoregressive=False):
+    """Train for one epoch"""
     model.train()
-    total, n = 0.0, 0
-    pbar = tqdm(loader, desc=f"Train {epoch}/{num_epochs}", ncols=120)
-    for x, y in pbar:
-        x = x.to(device)  # [B, seq_len, 39]
-        y = y.to(device)  # [B, pred_len, 12]
+    total_loss = 0.0
+    loss_details = {}
 
-        # Teacher forcing decay (linear from base_tf -> end_tf)
-        alpha = min(1.0, epoch / max(1, num_epochs//2))
-        tf_ratio = base_tf * (1.0 - alpha) + end_tf * alpha
+    pbar = tqdm(loader, desc=f'S{stage}E{epoch:02d} Train', leave=False)
+    for batch_idx, (inputs, targets_robot, targets_phase) in enumerate(pbar):
+        inputs = inputs.to(device)
+        targets_robot = targets_robot.to(device)
+        targets_phase = targets_phase.to(device)
 
-        pred = model(x, pred_len=y.size(1), teacher_forcing_ratio=tf_ratio, y_gt=y)
-        loss = crit(pred, y)
+        optimizer.zero_grad()
 
-        opt.zero_grad(set_to_none=True)
+        # Forward: Stage 1-3 parallel, Stage 4 autoregressive
+        pred_robot, pred_phase = model(inputs, pred_len=targets_robot.shape[1],
+                                       autoregressive=autoregressive,
+                                       y_gt=targets_robot if autoregressive else None,
+                                       return_phase=True)
+
+        # Compute loss
+        loss, details = criterion(pred_robot, pred_phase, targets_robot, targets_phase)
+
+        # Backward
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-        total += float(loss)
-        n += 1
-        pbar.set_postfix(loss=float(loss), tf=tf_ratio)
-    return total / max(1, n)
+        total_loss += loss.item()
+        for k, v in details.items():
+            loss_details[k] = loss_details.get(k, 0.0) + v
+
+        # Update progress bar
+        pbar.set_postfix({'loss': f'{loss.item():.2f}'})
+
+    avg_loss = total_loss / len(loader)
+    for k in loss_details:
+        loss_details[k] /= len(loader)
+
+    return avg_loss, loss_details
 
 
 @torch.no_grad()
-def validate(model, loader, crit, device, epoch, num_epochs):
-    """Validation without teacher forcing"""
+def evaluate(model, loader, criterion, device, autoregressive=False):
+    """
+    Evaluate on validation set
+    Note: Loss is computed in torso-normalized coordinate space,
+    which is consistent with training.
+    """
     model.eval()
-    total, n = 0.0, 0
-    pbar = tqdm(loader, desc=f"Val   {epoch}/{num_epochs}", ncols=120)
-    for x, y in pbar:
-        x = x.to(device)
-        y = y.to(device)
-        pred = model(x, pred_len=y.size(1), teacher_forcing_ratio=0.0)
-        loss = crit(pred, y)
-        total += float(loss)
-        n += 1
-        pbar.set_postfix(loss=float(loss))
-    return total / max(1, n)
-
-
-def train_full_trajectory_epoch(model, loader, opt, crit, device, epoch, num_epochs):
-    """Full trajectory training for Phase 2"""
-    model.train()
     total_loss = 0.0
-    n_batches = 0
+    robot_loss = 0.0
+    phase_loss = 0.0
 
-    pbar = tqdm(loader, desc=f"Traj Train {epoch}/{num_epochs}", ncols=120)
+    pbar = tqdm(loader, desc='Validation', leave=False)
+    for inputs, targets_robot, targets_phase in pbar:
+        inputs = inputs.to(device)
+        targets_robot = targets_robot.to(device)
+        targets_phase = targets_phase.to(device)
 
-    for x, y in pbar:
-        x = x.to(device)  # [B, seq_len, 39]
-        y = y.to(device)  # [B, pred_len, 12]
+        pred_robot, pred_phase = model(inputs, pred_len=targets_robot.shape[1],
+                                       autoregressive=autoregressive,
+                                       y_gt=None, return_phase=True)
 
-        opt.zero_grad()
+        loss, details = criterion(pred_robot, pred_phase, targets_robot, targets_phase)
+        total_loss += loss.item()
+        robot_loss += details.get('robot', 0.0)
+        phase_loss += details.get('phase', 0.0)
 
-        # Autoregressive prediction with reduced teacher forcing
-        pred = model(x, pred_len=y.size(1), teacher_forcing_ratio=0.2)
+        pbar.set_postfix({'loss': f'{loss.item():.2f}'})
 
-        # Calculate trajectory-level loss
-        loss = crit(pred, y)
-        loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-
-        total_loss += float(loss)
-        n_batches += 1
-
-        pbar.set_postfix(loss=float(loss))
-
-    return total_loss / max(1, n_batches)
+    return total_loss / len(loader), robot_loss / len(loader), phase_loss / len(loader)
 
 
-def load_config(config_path):
-    """Load training configuration from JSON file"""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-
-    print(f"Loaded config from {config_path}")
-    return config
-
-
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Train motion prediction model on augmented data')
-
-    parser.add_argument('--config', type=str, default='configs/30_10.json',
-                       help='Path to configuration JSON file')
-
-    return parser.parse_args()
-
-
-# ---------- Main Training Loop ----------
 def main():
-    args = parse_args()
-    cfg = load_config(args.config)
+    parser = argparse.ArgumentParser(description='4-stage training with progressive augmentation')
+    parser.add_argument('--config', type=str, default='configs/30_10.json',
+                       help='Path to config file')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume from checkpoint (e.g., best_model_stage3.pth)')
+    parser.add_argument('--start_stage', type=int, default=1,
+                       help='Stage to start from (1-4, default: 1)')
 
-    os.makedirs(cfg["save_dir"], exist_ok=True)
-    with open(os.path.join(cfg["save_dir"], "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+    args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # Load config
+    with open(args.config, 'r') as f:
+        cfg = json.load(f)
 
-    # Create initial augmented data loaders (noise will be updated per epoch)
-    print(f"\nLoading augmented data from: {cfg['data_root']}")
-    # Note: train_loader will be recreated each epoch with progressive noise
-    _, val_loader, test_loader = create_augmented_data_loaders(
-        data_root=cfg["data_root"],
-        batch_size=cfg["batch_size"],
-        sequence_length=cfg["sequence_length"],
-        prediction_length=cfg["prediction_length"],
-        train_ratio=cfg["train_ratio"],
-        val_ratio=cfg["val_ratio"],
-        test_ratio=cfg["test_ratio"],
-        num_workers=cfg["num_workers"],
-        noise_std_skeleton_mm=0.0,
-        noise_std_robot_mm=0.0,
-        noise_spike_prob=0.0,
-        noise_spike_magnitude_mm=0.0
-    )
+    print(f"Loaded config from {args.config}")
+    print(f"Save dir: {cfg['save_dir']}")
 
-    # Model with 39D input (9 joints + 4 robot endpoints)
-    skeleton_dim = 39
+    device = torch.device(args.device)
+    os.makedirs(cfg['save_dir'], exist_ok=True)
+
+    # Initialize logger
+    config_name = os.path.splitext(os.path.basename(args.config))[0]
+    logger = TrainingLogger(cfg['save_dir'], config_name)
+
+    # Create model
     model = get_model(
-        hidden_dim=cfg["hidden_dim"],
-        num_layers=cfg["num_layers"],
-        dropout=cfg["dropout"],
-        skeleton_dim=skeleton_dim,
+        skeleton_dim=39,
         output_dim=12,
-        num_heads=cfg["num_heads"]
+        hidden_dim=cfg['hidden_dim'],
+        num_layers=cfg['num_layers'],
+        num_heads=cfg['num_heads'],
+        dropout=cfg['dropout']
     ).to(device)
 
-    print(f"\nModel created: input_dim={skeleton_dim}, output_dim=12")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    # ========== Phase 1: Frame-level training ==========
-    print("\n" + "="*60)
-    print("Phase 1: Frame-level training with teacher forcing")
-    print("="*60)
+    # Resume from checkpoint if specified
+    if args.resume:
+        checkpoint_path = os.path.join(cfg['save_dir'], args.resume)
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Resumed from {args.resume} (Stage {checkpoint.get('stage', '?')}, Epoch {checkpoint.get('epoch', '?')})")
+        else:
+            print(f"Warning: Checkpoint {checkpoint_path} not found, starting from scratch")
 
-    crit = EndpointLoss(cfg["first_w"], cfg["smooth_vel_w"], cfg["smooth_acc_w"])
-    opt = optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=1e-5)
-    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8, verbose=True)
+    # Create loss
+    criterion = CombinedLoss(
+        robot_weight=cfg['robot_loss_w'],
+        phase_weight=cfg['phase_loss_w'],
+        coherence_weight=cfg['coherence_loss_w'],
+        speed_weight=cfg['speed_penalty_w'],
+        max_speed_mm_per_frame=cfg['max_speed_mm_per_frame'],
+        smooth_vel_weight=cfg['smooth_vel_w'],
+        smooth_acc_weight=cfg['smooth_acc_w']
+    )
 
-    best = float("inf")
-    best_path = os.path.join(cfg["save_dir"], "best_model.pth")
-
+    # Track best losses for each stage
+    best_val_losses = {1: float('inf'), 2: float('inf'), 3: float('inf'), 4: float('inf')}
     t0 = time.time()
-    for epoch in range(1, cfg["num_epochs"] + 1):
-        # Get progressive noise parameters for this epoch
-        noise_std_skel, noise_std_robot, spike_prob, spike_mag = get_progressive_noise_params(epoch, cfg["num_epochs"])
 
-        # Recreate train_loader with updated noise parameters
-        train_loader, _, _ = create_augmented_data_loaders(
-            data_root=cfg["data_root"],
-            batch_size=cfg["batch_size"],
-            sequence_length=cfg["sequence_length"],
-            prediction_length=cfg["prediction_length"],
-            train_ratio=cfg["train_ratio"],
-            val_ratio=cfg["val_ratio"],
-            test_ratio=cfg["test_ratio"],
-            num_workers=cfg["num_workers"],
-            noise_std_skeleton_mm=noise_std_skel,
-            noise_std_robot_mm=noise_std_robot,
-            noise_spike_prob=spike_prob,
-            noise_spike_magnitude_mm=spike_mag
-        )
+    # Load datasets once (use test as validation)
+    from utils import CSVTrajectoryDataset
+    print("\nLoading GT training data...")
+    train_ds_gt = CSVTrajectoryDataset([cfg['train_csv_gt']], cfg['sequence_length'],
+                                       cfg['prediction_length'], use_gt=True, augmentation_config=None)
+    print("Loading Pred training data...")
+    train_ds_pred = CSVTrajectoryDataset([cfg['train_csv_pred']], cfg['sequence_length'],
+                                         cfg['prediction_length'], use_gt=False, augmentation_config=None)
 
-        # Display current noise parameters (1:1:2 ratio)
-        stage1_end = cfg["num_epochs"] // 4
-        stage2_end = cfg["num_epochs"] // 2
-        stage = 1 if epoch <= stage1_end else (2 if epoch <= stage2_end else 3)
-        print(f"[Epoch {epoch:03d}] Stage {stage}: skel_std={noise_std_skel:.1f}mm, robot_std={noise_std_robot:.1f}mm, spike_prob={spike_prob:.2f}")
+    print("Loading GT validation data...")
+    val_ds_gt = CSVTrajectoryDataset([cfg['test_csv_gt']], cfg['sequence_length'],
+                                     cfg['prediction_length'], use_gt=True, augmentation_config=None)
+    print("Loading Pred validation data...")
+    val_ds_pred = CSVTrajectoryDataset([cfg['test_csv_pred']], cfg['sequence_length'],
+                                       cfg['prediction_length'], use_gt=False, augmentation_config=None)
 
-        tr = train_one_epoch(model, train_loader, opt, crit, device, epoch, cfg["num_epochs"])
-        va = validate(model, val_loader, crit, device, epoch, cfg["num_epochs"])
-        sched.step(va)
-        print(f"[Phase1][Epoch {epoch:03d}] train={tr:.6f}  val={va:.6f}  lr={opt.param_groups[0]['lr']:.2e}")
+    # Create validation loaders (we'll use both GT and Pred for comprehensive evaluation)
+    val_loader_gt = torch.utils.data.DataLoader(val_ds_gt, batch_size=cfg['batch_size'],
+                                                 shuffle=False, num_workers=cfg['num_workers'])
+    val_loader_pred = torch.utils.data.DataLoader(val_ds_pred, batch_size=cfg['batch_size'],
+                                                   shuffle=False, num_workers=cfg['num_workers'])
 
-        if va < best:
-            best = va
-            torch.save({"model_state_dict": model.state_dict(), "config": cfg}, best_path)
-            print(f"[Phase1] Saved best to {best_path} (val={best:.6f})")
+    # ===== Stage 1 =====
+    if args.start_stage <= 1:
+        print("\n" + "="*60)
+        print("Stage 1: GT only + rotation + noise (0→50mm)")
+        print("="*60)
 
-    print(f"Phase 1 done. Best val={best:.6f}. Elapsed {time.time()-t0:.1f}s.")
+        optimizer = optim.Adam(model.parameters(), lr=cfg['stage1_lr'], weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5, verbose=True)
 
-    # ========== Phase 2: Trajectory-level training ==========
-    print("\n" + "="*60)
-    print("Phase 2: Full trajectory training with jitter/speed penalties")
+        for epoch in range(cfg['stage1_epochs']):
+            aug_cfg = get_augmentation_config(1, epoch, cfg['stage1_epochs'], cfg)
+
+            # Stage 1: Use GT data only
+            train_ds_gt.set_augmentation_config(aug_cfg)
+            train_loader = torch.utils.data.DataLoader(train_ds_gt, batch_size=cfg['batch_size'],
+                                                       shuffle=True, num_workers=cfg['num_workers'])
+
+            # Stage 1: parallel prediction (autoregressive=False)
+            train_loss, _ = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch+1, 1, autoregressive=False)
+
+            # Evaluate on both GT and Pred data
+            val_loss_gt, val_robot_gt, val_phase_gt = evaluate(model, val_loader_gt, criterion, device, autoregressive=False)
+            val_loss_pred, val_robot_pred, val_phase_pred = evaluate(model, val_loader_pred, criterion, device, autoregressive=False)
+            val_loss = (val_loss_gt + val_loss_pred) / 2  # Average validation loss
+
+            scheduler.step(val_loss)
+
+            aug_info = f"noise={aug_cfg['noise_std']:.1f}mm"
+            print(f"[S1E{epoch+1:02d}] train={train_loss:.4f} val_gt={val_loss_gt:.4f} val_pred={val_loss_pred:.4f} "
+                  f"rob_gt={val_robot_gt:.4f} rob_pred={val_robot_pred:.4f} {aug_info}")
+
+            # Log metrics
+            logger.log(1, epoch+1, 'train', train_loss, val_loss, val_robot_gt, val_phase_gt,
+                      optimizer.param_groups[0]['lr'], aug_info)
+
+            # Save stage-specific best
+            if val_loss < best_val_losses[1]:
+                best_val_losses[1] = val_loss
+                torch.save({'model_state_dict': model.state_dict(), 'stage': 1, 'epoch': epoch+1,
+                           'val_loss': val_loss, 'config': cfg},
+                          os.path.join(cfg['save_dir'], 'best_model_stage1.pth'))
+                print(f"  → Saved Stage 1 best (val_avg={val_loss:.4f})")
+
+    # ===== Stage 2 =====
+    if args.start_stage <= 2:
+        print("\n" + "="*60)
+        print("Stage 2: GT/Pred mix (80%→20%) + augmentation progression")
+        print("="*60)
+
+        optimizer = optim.Adam(model.parameters(), lr=cfg['stage2_lr'], weight_decay=1e-5)
+
+        for epoch in range(cfg['stage2_epochs']):
+            progress = epoch / cfg['stage2_epochs']
+            gt_ratio = cfg['stage2_gt_ratio_start'] + (cfg['stage2_gt_ratio_end'] - cfg['stage2_gt_ratio_start']) * progress
+
+            aug_cfg = get_augmentation_config(2, epoch, cfg['stage2_epochs'], cfg)
+
+            # Stage 2: Mix GT and Pred data based on gt_ratio
+            train_ds_gt.set_augmentation_config(aug_cfg)
+            train_ds_pred.set_augmentation_config(aug_cfg)
+
+            # Create mixed dataset by concatenating subsets
+            from torch.utils.data import ConcatDataset, Subset
+            n_gt_samples = int(len(train_ds_gt) * gt_ratio)
+            n_pred_samples = len(train_ds_gt) - n_gt_samples
+
+            gt_subset = Subset(train_ds_gt, range(n_gt_samples))
+            pred_subset = Subset(train_ds_pred, range(n_pred_samples))
+            mixed_ds = ConcatDataset([gt_subset, pred_subset])
+
+            train_loader = torch.utils.data.DataLoader(mixed_ds, batch_size=cfg['batch_size'],
+                                                       shuffle=True, num_workers=cfg['num_workers'])
+
+            train_loss, _ = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch+1, 2, autoregressive=False)
+
+            # Evaluate on both GT and Pred data
+            val_loss_gt, val_robot_gt, val_phase_gt = evaluate(model, val_loader_gt, criterion, device, autoregressive=False)
+            val_loss_pred, val_robot_pred, val_phase_pred = evaluate(model, val_loader_pred, criterion, device, autoregressive=False)
+            val_loss = (val_loss_gt + val_loss_pred) / 2
+
+            aug_info = f"gt={gt_ratio:.2f} time_scale={aug_cfg['time_scale_prob']:.2f} init_pos={aug_cfg['initial_pos_prob']:.2f}"
+            print(f"[S2E{epoch+1:02d}] train={train_loss:.4f} val_gt={val_loss_gt:.4f} val_pred={val_loss_pred:.4f} {aug_info}")
+
+            # Log metrics
+            logger.log(2, epoch+1, 'train', train_loss, val_loss, val_robot_gt, val_phase_gt,
+                      optimizer.param_groups[0]['lr'], aug_info)
+
+            # Save stage-specific best
+            if val_loss < best_val_losses[2]:
+                best_val_losses[2] = val_loss
+                torch.save({'model_state_dict': model.state_dict(), 'stage': 2, 'epoch': epoch+1,
+                           'val_loss': val_loss, 'config': cfg},
+                          os.path.join(cfg['save_dir'], 'best_model_stage2.pth'))
+                print(f"  → Saved Stage 2 best (val_avg={val_loss:.4f})")
+
+    # ===== Stage 3 =====
+    if args.start_stage <= 3:
+        print("\n" + "="*60)
+        print("Stage 3: Pred only + full augmentation")
+        print("="*60)
+
+        optimizer = optim.Adam(model.parameters(), lr=cfg['stage3_lr'], weight_decay=1e-5)
+
+        # Stage 3: Progressive phase/coherence weight increase (0.5→1.0, 0.3→1.0)
+        phase_weight_start = cfg['phase_loss_w']         # 0.5
+        phase_weight_end = 1.0
+        coherence_weight_start = cfg['coherence_loss_w'] # 0.3
+        coherence_weight_end = 1.0
+
+        for epoch in range(cfg['stage3_epochs']):
+            aug_cfg = get_augmentation_config(3, epoch, cfg['stage3_epochs'], cfg)
+
+            # Progressive weight increase
+            progress = epoch / max(1, cfg['stage3_epochs'] - 1)
+            phase_weight = phase_weight_start + (phase_weight_end - phase_weight_start) * progress
+            coherence_weight = coherence_weight_start + (coherence_weight_end - coherence_weight_start) * progress
+            criterion.set_phase_weights(phase_weight, coherence_weight)
+
+            # Stage 3: Use Pred data only
+            train_ds_pred.set_augmentation_config(aug_cfg)
+            train_loader = torch.utils.data.DataLoader(train_ds_pred, batch_size=cfg['batch_size'],
+                                                       shuffle=True, num_workers=cfg['num_workers'])
+
+            train_loss, _ = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch+1, 3, autoregressive=False)
+
+            # Evaluate on both GT and Pred data
+            val_loss_gt, val_robot_gt, val_phase_gt = evaluate(model, val_loader_gt, criterion, device, autoregressive=False)
+            val_loss_pred, val_robot_pred, val_phase_pred = evaluate(model, val_loader_pred, criterion, device, autoregressive=False)
+            val_loss = (val_loss_gt + val_loss_pred) / 2
+
+            aug_info = f"pred_only ph_w={phase_weight:.2f} coh_w={coherence_weight:.2f}"
+            print(f"[S3E{epoch+1:02d}] train={train_loss:.4f} val_gt={val_loss_gt:.4f} val_pred={val_loss_pred:.4f} {aug_info}")
+
+            # Log metrics
+            logger.log(3, epoch+1, 'train', train_loss, val_loss, val_robot_gt, val_phase_gt,
+                      optimizer.param_groups[0]['lr'], aug_info)
+
+            # Save stage-specific best
+            if val_loss < best_val_losses[3]:
+                best_val_losses[3] = val_loss
+                torch.save({'model_state_dict': model.state_dict(), 'stage': 3, 'epoch': epoch+1,
+                           'val_loss': val_loss, 'config': cfg},
+                          os.path.join(cfg['save_dir'], 'best_model_stage3.pth'))
+                print(f"  → Saved Stage 3 best (val_avg={val_loss:.4f})")
+
+    # ===== Stage 4 =====
+    if args.start_stage <= 4:
+        print("\n" + "="*60)
+        print("Stage 4: Trajectory-level autoregressive + phase coherence (Pred data)")
+        print("="*60)
+
+        # Stage 4: Keep phase/coherence weights at 1.0
+        criterion.set_phase_weights(1.0, 1.0)
+
+        optimizer = optim.Adam(model.parameters(), lr=cfg['stage4_lr'], weight_decay=1e-5)
+
+        for epoch in range(cfg['stage4_epochs']):
+            aug_cfg = get_augmentation_config(4, epoch, cfg['stage4_epochs'], cfg)
+
+            # Stage 4: Use Pred data with smaller batch for trajectory-level autoregressive
+            train_ds_pred.set_augmentation_config(aug_cfg)
+            train_loader = torch.utils.data.DataLoader(train_ds_pred, batch_size=32,
+                                                       shuffle=True, num_workers=cfg['num_workers'])
+
+            # Stage 4: Use autoregressive mode
+            train_loss, train_details = train_one_epoch(model, train_loader, optimizer, criterion, device,
+                                                         epoch+1, 4, autoregressive=True)
+
+            # Evaluate on both GT and Pred data with autoregressive mode
+            val_loss_gt, val_robot_gt, val_phase_gt = evaluate(model, val_loader_gt, criterion, device, autoregressive=True)
+            val_loss_pred, val_robot_pred, val_phase_pred = evaluate(model, val_loader_pred, criterion, device, autoregressive=True)
+            val_loss = (val_loss_gt + val_loss_pred) / 2
+
+            aug_info = f"coh={train_details.get('coherence',0):.3f} spd={train_details.get('speed',0):.3f}"
+            print(f"[S4E{epoch+1:02d}] train={train_loss:.4f} val_gt={val_loss_gt:.4f} val_pred={val_loss_pred:.4f} {aug_info}")
+
+            # Log metrics
+            logger.log(4, epoch+1, 'train', train_loss, val_loss, val_robot_gt, val_phase_gt,
+                      optimizer.param_groups[0]['lr'], aug_info)
+
+            # Save stage-specific best
+            if val_loss < best_val_losses[4]:
+                best_val_losses[4] = val_loss
+                torch.save({'model_state_dict': model.state_dict(), 'stage': 4, 'epoch': epoch+1,
+                           'val_loss': val_loss, 'config': cfg},
+                          os.path.join(cfg['save_dir'], 'best_model_stage4.pth'))
+                print(f"  → Saved Stage 4 best (val_avg={val_loss:.4f})")
+
+    print(f"\n{'='*60}")
+    print(f"Done! Time: {time.time()-t0:.1f}s")
+    print(f"Stage best losses: S1={best_val_losses[1]:.4f} S2={best_val_losses[2]:.4f} "
+          f"S3={best_val_losses[3]:.4f} S4={best_val_losses[4]:.4f}")
+    print(f"Saved to: {cfg['save_dir']}/best_model_stage[1-4].pth")
     print("="*60)
-
-    # Get file lists for trajectory training
-    processor = AugmentedDataProcessor(cfg["data_root"])
-    base_names = processor.get_base_names()
-    file_groups = processor.file_groups
-
-    # Use train split for trajectory training
-    np.random.seed(42)
-    shuffled_bases = np.random.permutation(base_names).tolist()
-    n_total = len(shuffled_bases)
-    n_train = int(n_total * cfg["train_ratio"])
-    train_bases = shuffled_bases[:n_train]
-    train_files = [f for base in train_bases for f in file_groups[base]]
-
-    # Create trajectory dataset
-    full_traj_dataset = AugmentedFullTrajectoryDataset(
-        train_files, cfg["data_root"],
-        cfg["sequence_length"], cfg["prediction_length"]
-    )
-
-    traj_loader = DataLoader(
-        full_traj_dataset,
-        batch_size=cfg.get("traj_batch_size", 16),
-        shuffle=True,
-        num_workers=cfg.get("num_workers", 4),
-        pin_memory=True
-    )
-
-    # Trajectory-level loss
-    traj_crit = TrajectoryJitterLoss(
-        velocity_w=cfg.get("traj_velocity_w", 1.0),
-        acceleration_w=cfg.get("traj_acceleration_w", 2.0),
-        jerk_w=cfg.get("traj_jerk_w", 3.0),
-        max_speed_mm_per_s=cfg.get("traj_max_speed_mm_s", 300.0),
-        data_processor=None
-    )
-
-    # Use smaller learning rate
-    traj_lr = cfg.get("traj_learning_rate", cfg["learning_rate"] * 0.1)
-    traj_opt = optim.Adam(model.parameters(), lr=traj_lr, weight_decay=1e-5)
-
-    traj_epochs = cfg.get("traj_epochs", max(5, cfg["num_epochs"] // 10))
-    traj_best = float("inf")
-    traj_best_path = os.path.join(cfg["save_dir"], "best_traj_model.pth")
-
-    print(f"Trajectory training: {traj_epochs} epochs, lr={traj_lr:.2e}")
-    print(f"Traj loader: {len(full_traj_dataset)} segments, batch={cfg.get('traj_batch_size', 16)}")
-
-    for epoch in range(1, traj_epochs + 1):
-        traj_loss = train_full_trajectory_epoch(
-            model, traj_loader, traj_opt, traj_crit, device,
-            epoch, traj_epochs
-        )
-
-        # Validate on original validation set
-        val_loss = validate(model, val_loader, crit, device, epoch, traj_epochs)
-
-        print(f"[Phase2][Epoch {epoch:03d}] traj_loss={traj_loss:.6f}  val={val_loss:.6f}  lr={traj_opt.param_groups[0]['lr']:.2e}")
-
-        if val_loss < traj_best:
-            traj_best = val_loss
-            torch.save({"model_state_dict": model.state_dict(), "config": cfg}, traj_best_path)
-            print(f"[Phase2] Saved best trajectory model to {traj_best_path} (val={traj_best:.6f})")
-
-    print(f"\nPhase 2 done. Best traj val={traj_best:.6f}. Total elapsed {time.time()-t0:.1f}s.")
-    print("\nTraining completed! Models saved:")
-    print(f"  - Frame-level best: {best_path}")
-    print(f"  - Trajectory-level best: {traj_best_path}")
-
-    # Save test loader info for test.py
-    test_info = {
-        "test_bases": shuffled_bases[n_train+int(n_total*cfg["val_ratio"]):],
-        "data_root": cfg["data_root"],
-        "sequence_length": cfg["sequence_length"],
-        "prediction_length": cfg["prediction_length"]
-    }
-    test_info_path = os.path.join(cfg["save_dir"], "test_info.json")
-    with open(test_info_path, "w") as f:
-        json.dump(test_info, f, indent=2)
-    print(f"  - Test info: {test_info_path}")
 
 
 if __name__ == "__main__":

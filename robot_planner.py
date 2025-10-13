@@ -12,6 +12,7 @@ import rclpy
 from rclpy.node import Node
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import Point, Quaternion, PoseArray, Pose
+from std_msgs.msg import Int32
 import numpy as np
 import torch
 from collections import deque
@@ -20,7 +21,7 @@ import os
 
 # Import model and utils
 from net import get_model
-from utils import normalize_to_torso, clip_arms_to_40cm
+from utils import normalize_to_torso
 
 
 class RobotPlanner(Node):
@@ -72,6 +73,7 @@ class RobotPlanner(Node):
 
         # Publishers
         self.target_poses_publisher = self.create_publisher(PoseArray, '/target_poses', 10)
+        self.phase_publisher = self.create_publisher(Int32, '/predicted_phase', 10)
 
         # Subscribers
         self.pose_subscriber = self.create_subscription(
@@ -107,7 +109,7 @@ class RobotPlanner(Node):
 
             # Perform inference when we have enough frames
             if len(self.pose_buffer) == self.sequence_length:
-                predicted_arms = self.predict_arm_positions()
+                predicted_arms, predicted_phase = self.predict_arm_positions()
 
                 if predicted_arms is not None:
                     # Update current robot position for next prediction (use first predicted frame)
@@ -118,6 +120,7 @@ class RobotPlanner(Node):
 
                     # Publish predictions
                     self.publish_target_poses(ros_arm_positions)
+                    self.publish_phase(predicted_phase)
 
         except Exception as e:
             self.get_logger().error(f'Error in pose callback: {e}')
@@ -207,24 +210,30 @@ class RobotPlanner(Node):
 
             # Model inference
             with torch.no_grad():
-                output = self.model(input_tensor, pred_len=self.prediction_length)  # [1, pred_len, 12]
+                predicted_robot, predicted_phase_logits = self.model(
+                    input_tensor,
+                    pred_len=self.prediction_length,
+                    autoregressive=False,
+                    return_phase=True
+                )  # [1, pred_len, 12], [1, pred_len, 3]
 
             # Convert back to numpy: [pred_len, 12] -> [pred_len, 4, 3]
-            predicted_arms = output.cpu().numpy().squeeze(0).reshape(self.prediction_length, 4, 3)
+            predicted_arms = predicted_robot.cpu().numpy().squeeze(0).reshape(self.prediction_length, 4, 3)
 
-            # Apply arm length clipping (like in training)
-            predicted_arms = clip_arms_to_40cm(predicted_arms)
+            # Get phase prediction (use first prediction step)
+            phase_logits = predicted_phase_logits.cpu().numpy().squeeze(0)  # [pred_len, 3]
+            predicted_phase = int(np.argmax(phase_logits[0]))  # Use first prediction
 
             # Transform back to world coordinates by adding torso position
             current_torso = sequence[-1, 8]  # Latest torso position [3]
             for t in range(self.prediction_length):
                 predicted_arms[t] += current_torso[None, :]  # Add torso to all 4 endpoints
 
-            return predicted_arms
+            return predicted_arms, predicted_phase
 
         except Exception as e:
             self.get_logger().error(f'Error in prediction: {e}')
-            return None
+            return None, 0
 
     def vector_to_quaternion(self, direction_vector):
         """Convert a direction vector to a quaternion representing rotation from +X axis"""
@@ -320,13 +329,34 @@ class RobotPlanner(Node):
             f'Lengths: L={left_length*100:.1f}cm, R={right_length*100:.1f}cm'
         )
 
+    def publish_phase(self, phase):
+        """Publish predicted phase"""
+        phase_msg = Int32()
+        phase_msg.data = phase
+        self.phase_publisher.publish(phase_msg)
+
+        phase_names = ['Approaching', 'Assisting', 'Leaving']
+        self.get_logger().info(f'Published Phase: {phase} ({phase_names[phase]})')
+
 
 def main(args=None):
     rclpy.init(args=args)
 
-    # Model and config paths
-    model_path = os.path.join(os.path.dirname(__file__), 'checkpoints_30_10', 'best_model.pth')
+    # Model and config paths - use latest stage model
+    save_dir = os.path.join(os.path.dirname(__file__), 'checkpoints_30_10')
     config_path = os.path.join(os.path.dirname(__file__), 'configs', '30_10.json')
+
+    # Try to find the latest stage model (4 > 3 > 2 > 1)
+    model_path = None
+    for stage in [4, 3, 2, 1]:
+        stage_ckpt = os.path.join(save_dir, f'best_model_stage{stage}.pth')
+        if os.path.exists(stage_ckpt):
+            model_path = stage_ckpt
+            break
+
+    if model_path is None:
+        # Fallback to old naming
+        model_path = os.path.join(save_dir, 'best_model.pth')
 
     if not os.path.exists(model_path):
         print(f"Error: Model file not found at {model_path}")
@@ -346,6 +376,7 @@ def main(args=None):
         print("Topics:")
         print("  - Subscribing to: /pose_detection (MarkerArray)")
         print("  - Publishing to: /target_poses (PoseArray - 2 arm centers)")
+        print("  - Publishing to: /predicted_phase (Int32 - 0:Approaching, 1:Assisting, 2:Leaving)")
         print("Pose order: [Left_Arm_Center, Right_Arm_Center]")
         print("Position: Midpoint between L1-L2 and R1-R2")
         print("Orientation: Left arm L2→L1, Right arm R2→R1")
