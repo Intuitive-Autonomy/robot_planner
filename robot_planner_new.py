@@ -28,6 +28,7 @@ class RobotPlannerNew(Node):
         self.mode = 'rest'  # rest, approach, assist, retreat
         self.last_assist_position = None  # Human position at last assist frame
         self.last_assist_orientation = None  # Human orientation at last assist frame
+        self.last_assist_height = None  # Height at last assist frame
 
         # Rest mode fixed target
         self.rest_target_position = None  # Fixed target position in rest mode
@@ -145,9 +146,10 @@ class RobotPlannerNew(Node):
                 self.get_logger().info('Robot within 0.5m, entering assist mode')
 
         elif self.mode == 'assist':
-            # Save current position for retreat
+            # Save current position and height for retreat
             self.last_assist_position = human_pos_xy.copy()
             self.last_assist_orientation = self.calculate_human_orientation(joints[2], joints[3])
+            self.last_assist_height = current_height
 
             # assist -> retreat: significant height increase and stable
             if len(self.height_history) >= self.stable_frames:
@@ -193,19 +195,22 @@ class RobotPlannerNew(Node):
                 return self.create_front_position_poses(human_pos_xy, human_ori, distance=1.5, height=1.0)
 
         elif self.mode == 'approach':
-            # 0.4m in front, height 1m
-            return self.create_front_position_poses(human_pos_xy, human_ori, distance=0.4, height=1.0)
+            # 0.4m in front, height at shoulder - 10cm
+            # Calculate shoulder height (average of left and right shoulders)
+            r_shoulder, l_shoulder = joints[2], joints[3]
+            shoulder_height = (r_shoulder[2] + l_shoulder[2]) / 2.0 - 0.1  # 10cm below shoulders
+            return self.create_front_position_poses(human_pos_xy, human_ori, distance=0.4, height=shoulder_height)
 
         elif self.mode == 'assist':
             # Shoulder-based targets
             return self.create_shoulder_based_poses(joints)
 
         elif self.mode == 'retreat':
-            # Return to last assist position + 2.1m
-            if self.last_assist_position is not None:
+            # Return to last assist position + 2.1m, using last assist height
+            if self.last_assist_position is not None and self.last_assist_height is not None:
                 return self.create_front_position_poses(
                     self.last_assist_position, self.last_assist_orientation,
-                    distance=2.1, height=1.0)
+                    distance=2.1, height=self.last_assist_height)
             else:
                 # Fallback
                 return self.create_front_position_poses(human_pos_xy, human_ori, distance=2.0, height=1.0)

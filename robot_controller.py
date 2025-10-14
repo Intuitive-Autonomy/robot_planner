@@ -33,6 +33,10 @@ class RobotController(Node):
         self.control_rate = 10.0  # Hz
         self.dt = 1.0 / self.control_rate
 
+        # EMA smoothing parameters
+        self.ema_alpha = 0.5  # Smoothing factor (0 = no smoothing, 1 = no filtering)
+        self.ema_poses = None  # Smoothed poses [2] - EMA filtered poses
+
         # State variables
         self.current_poses = None  # [2] - current robot Pose objects (left, right)
         self.target_eef_poses = None  # Target from /target_eef_poses
@@ -52,6 +56,84 @@ class RobotController(Node):
         self.get_logger().info(f'Control rate: {self.control_rate} Hz')
         self.get_logger().info(f'Max linear vel: {self.max_linear_vel} m/s')
         self.get_logger().info(f'Max angular vel: {math.degrees(self.max_angular_vel)} deg/s')
+        self.get_logger().info(f'EMA alpha: {self.ema_alpha}')
+
+    def apply_ema_smoothing(self, new_poses):
+        """
+        Apply Exponential Moving Average smoothing to poses
+
+        Args:
+            new_poses: list of 2 Pose objects
+
+        Returns:
+            smoothed_poses: list of 2 Pose objects with EMA applied
+        """
+        if self.ema_poses is None:
+            # Initialize EMA with first poses
+            self.ema_poses = new_poses
+            return new_poses
+
+        smoothed_poses = []
+        for i in range(2):
+            # EMA for position
+            new_pos = np.array([new_poses[i].position.x, new_poses[i].position.y, new_poses[i].position.z])
+            ema_pos = np.array([self.ema_poses[i].position.x, self.ema_poses[i].position.y, self.ema_poses[i].position.z])
+
+            smoothed_pos = self.ema_alpha * new_pos + (1 - self.ema_alpha) * ema_pos
+
+            # SLERP for orientation (quaternion smoothing)
+            new_q = new_poses[i].orientation
+            ema_q = self.ema_poses[i].orientation
+
+            # Calculate dot product
+            dot = new_q.x * ema_q.x + new_q.y * ema_q.y + new_q.z * ema_q.z + new_q.w * ema_q.w
+
+            # If dot < 0, negate to take shorter path
+            if dot < 0:
+                ema_q.x = -ema_q.x
+                ema_q.y = -ema_q.y
+                ema_q.z = -ema_q.z
+                ema_q.w = -ema_q.w
+                dot = -dot
+
+            # Clamp and calculate angle
+            dot = np.clip(dot, -1.0, 1.0)
+            theta = np.arccos(dot)
+
+            # SLERP with ema_alpha as interpolation parameter
+            if theta < 1e-6:
+                # Linear interpolation for very close quaternions
+                smoothed_q = Quaternion(
+                    x=float(self.ema_alpha * new_q.x + (1 - self.ema_alpha) * ema_q.x),
+                    y=float(self.ema_alpha * new_q.y + (1 - self.ema_alpha) * ema_q.y),
+                    z=float(self.ema_alpha * new_q.z + (1 - self.ema_alpha) * ema_q.z),
+                    w=float(self.ema_alpha * new_q.w + (1 - self.ema_alpha) * ema_q.w)
+                )
+            else:
+                sin_theta = np.sin(theta)
+                a = np.sin((1 - self.ema_alpha) * theta) / sin_theta
+                b = np.sin(self.ema_alpha * theta) / sin_theta
+
+                smoothed_q = Quaternion(
+                    x=float(a * ema_q.x + b * new_q.x),
+                    y=float(a * ema_q.y + b * new_q.y),
+                    z=float(a * ema_q.z + b * new_q.z),
+                    w=float(a * ema_q.w + b * new_q.w)
+                )
+
+            # Create smoothed pose
+            smoothed_pose = Pose()
+            smoothed_pose.position.x = float(smoothed_pos[0])
+            smoothed_pose.position.y = float(smoothed_pos[1])
+            smoothed_pose.position.z = float(smoothed_pos[2])
+            smoothed_pose.orientation = smoothed_q
+
+            smoothed_poses.append(smoothed_pose)
+
+        # Update EMA state
+        self.ema_poses = smoothed_poses
+
+        return smoothed_poses
 
     def target_eef_callback(self, msg):
         """Receive target EEF poses"""
@@ -246,8 +328,11 @@ class RobotController(Node):
                 )
                 next_poses.append(next_pose)
 
+            # Apply EMA smoothing
+            smoothed_poses = self.apply_ema_smoothing(next_poses)
+
             # Publish target poses (next step)
-            self.publish_target_poses(next_poses)
+            self.publish_target_poses(smoothed_poses)
 
             # Update current poses: current = previous target
             self.current_poses = next_poses
