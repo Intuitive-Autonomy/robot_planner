@@ -67,26 +67,59 @@ python mocap_unified_publisher.py inference_trajectory_gt.csv 0 10.0 /path/to/mo
 
 ### Real-time Robot Planning
 
-#### `robot_planner.py`
-ROS2-based real-time robot trajectory planning:
-- Subscribes to motion capture data
+#### `robot_planner_new.py`
+State machine-based robot planner with four operational modes:
+- **rest**: Robot maintains 1.5m distance from human, allows manual positioning
+- **approach**: Triggered by 15cm height decrease, moves to 0.4m at 1m height
+- **assist**: Activates when robot is <0.5m from human, follows shoulder-based targets
+- **retreat**: Triggered by 10cm stable height increase, returns to 2.1m distance
+
+Key features:
+- Dynamic standing height tracking for robust state transitions
+- Publishes `/target_eef_poses` (PoseArray) for target end-effector positions
+- Publishes `/mode` (String) for current operational state
+- Arm spacing: 45cm for rest/approach/retreat, shoulder-based for assist
+
+```bash
+python robot_planner_new.py
+```
+
+#### `robot_controller.py`
+Velocity-constrained robot controller with SLERP-based orientation interpolation:
+- Subscribes to `/target_eef_poses` and applies motion constraints
+- Maximum linear velocity: 0.3 m/s (0.03m per step at 10Hz)
+- Maximum angular velocity: 10 deg/s (3° per step at 10Hz)
+- Uses quaternion SLERP for smooth orientation changes
+- Publishes `/target_poses` with 180° yaw rotation applied
+- Publishes `/current_poses` for robot state feedback
+
+```bash
+python robot_controller.py
+```
+
+#### `debug_visualizer.py`
+Real-time 3D visualization tool:
+- Subscribes to `/pose_detection` for human skeleton
+- Subscribes to `/target_poses` for robot targets
+- Visualizes human joints, skeleton connections, and joint labels
+- Displays robot arm targets with directional arrows
+- Shows target poses with RPY orientation axes (R=red, P=green, Y=blue)
+- Fixed coordinate ranges: X/Y ∈ [-1, 1]m, Z ∈ [0, 2]m
+- Equal aspect ratio for accurate spatial representation
+
+```bash
+python debug_visualizer.py
+```
+
+#### Legacy Planners
+
+**`robot_planner.py`** - Original neural network-based planner:
 - Uses trained model for real-time inference
-- Publishes robot end-effector trajectories
 - Supports configurable prediction horizons
 
-```bash
-ros2 run robot_planner robot_planner
-```
-
-#### `robot_planner_smoothed.py`
-Enhanced version with trajectory smoothing:
+**`robot_planner_smoothed.py`** - Enhanced version with trajectory smoothing:
 - Includes temporal smoothing filters
 - Reduces jitter in predicted trajectories
-- Better suited for real robot deployment
-
-```bash
-ros2 run robot_planner robot_planner_smoothed
-```
 
 ## Configuration
 
@@ -121,11 +154,54 @@ source /opt/ros/humble/setup.bash  # or your ROS2 distribution
 
 ## Usage Workflow
 
+### Training Pipeline
 1. **Data Preparation**: Prepare motion capture data in CSV format
 2. **Training**: Use `train.py` to train the neural network model
 3. **Validation**: Evaluate model performance with `val.py`
-4. **Motion Capture Publishing**: Use `mocap_unified_publisher.py` for data streaming
-5. **Real-time Inference**: Deploy with `robot_planner.py` or `robot_planner_smoothed.py`
+
+### Real-time Deployment Pipeline
+
+1. **Start Motion Capture Publisher**
+   ```bash
+   python mocap_unified_publisher.py <csv_file> <start_frame> <duration> <data_path>
+   ```
+   This publishes point cloud data to ROS2 topics.
+
+2. **Run Pose Detector** (from spike repository)
+   ```bash
+   cd spike
+   python pose_detector.py
+   ```
+   This subscribes to point cloud data and publishes detected human poses to `/pose_detection`.
+
+3. **Start Robot Planner**
+   ```bash
+   python robot_planner_new.py
+   ```
+   This node:
+   - Subscribes to `/pose_detection` for human pose
+   - Implements state machine (rest, approach, assist, retreat modes)
+   - Publishes target end-effector poses to `/target_eef_poses`
+   - Publishes current mode to `/mode`
+
+4. **Start Robot Controller**
+   ```bash
+   python robot_controller.py
+   ```
+   This node:
+   - Subscribes to `/target_eef_poses`
+   - Applies velocity constraints (0.3 m/s linear, 10 deg/s angular)
+   - Publishes smoothed target poses to `/target_poses` (with 180° yaw rotation)
+   - Publishes current robot poses to `/current_poses`
+
+5. **(Optional) Start Debug Visualizer**
+   ```bash
+   python debug_visualizer.py
+   ```
+   This provides real-time 3D visualization of:
+   - Human skeleton
+   - Robot arm targets
+   - Target poses with RPY axes
 
 ## Model Architecture
 

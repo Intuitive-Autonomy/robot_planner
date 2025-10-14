@@ -457,10 +457,17 @@ class MocapUnifiedPublisher(Node):
 
     def publish_pointcloud_data(self, row):
         """Load and publish pointcloud data synchronized with frame_id"""
-        frame_id = int(row['frame_id'])
+        # Parse frame_id: format is "XX_YYYYY", extract YYYYY as the pointcloud file number
+        frame_id_str = str(row['frame_id'])
+        if '_' in frame_id_str:
+            # Format: "03_00267" -> extract 267
+            frame_number = int(frame_id_str.split('_')[1])
+        else:
+            # Fallback: try to convert directly to int
+            frame_number = int(frame_id_str)
 
-        # Construct pointcloud file path based on frame_id
-        pointcloud_file = os.path.join(self.pointcloud_dir, f'{frame_id}.npz')
+        # Construct pointcloud file path based on frame number
+        pointcloud_file = os.path.join(self.pointcloud_dir, f'{frame_number}.npz')
 
         if not os.path.exists(pointcloud_file):
             self.get_logger().debug(f'Pointcloud file not found: {pointcloud_file}')

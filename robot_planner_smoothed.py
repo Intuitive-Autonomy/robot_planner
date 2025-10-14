@@ -262,6 +262,27 @@ class RobotPlannerSmoothed(Node):
 
             # Perform inference when we have enough frames
             if len(self.pose_buffer) == self.sequence_length:
+                # Initialize robot position on first inference
+                if not hasattr(self, '_robot_initialized'):
+                    self._robot_initialized = True
+                    torso = transformed_joints[8]  # Current torso position [x, y, z] in mm
+
+                    # Robot faces human from front, 2m away, at 1m height
+                    robot_y = torso[1] - 2000  # 2m in front (negative Y)
+                    robot_z = 1000  # Fixed height at 1m
+
+                    # Two arms parallel, placed side by side in XZ plane
+                    arm_length = 400  # mm
+                    arm_spacing = 200  # mm from center
+
+                    self.current_robot_pos = np.array([
+                        [torso[0] - arm_spacing, robot_y, robot_z],              # Left back
+                        [torso[0] - arm_spacing, robot_y + arm_length, robot_z], # Left front
+                        [torso[0] + arm_spacing, robot_y, robot_z],              # Right back
+                        [torso[0] + arm_spacing, robot_y + arm_length, robot_z], # Right front
+                    ], dtype=np.float32)
+                    self.get_logger().info(f'Initialized robot at: Y={robot_y:.1f}mm (2m from human), Z={robot_z}mm (1m height)')
+
                 predicted_arms, predicted_phase = self.predict_arm_positions()
 
                 if predicted_arms is not None:
